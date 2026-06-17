@@ -10,7 +10,7 @@
 #define I2C_MASTER_SCL_IO       22
 #define I2C_MASTER_SDA_IO       21
 #define I2C_MASTER_NUM          I2C_NUM_0
-#define I2C_MASTER_FREQ_HZ      10000
+#define I2C_MASTER_FREQ_HZ      400000
 #define I2C_TIMEOUT_MS          1000
 #define INA226_ADDR             0x40
 #define REG_CONFIG              0x00
@@ -33,7 +33,7 @@
 #define FINAL_IDLE_MS           10000
 #define WORKLOAD_CYCLE_MS       100
 #define WORKLOAD_BUSY_MS        50
-#define MEASUREMENT_INTERVAL_MS 100
+#define MEASUREMENT_INTERVAL_MS 20
 
 /* 0 = idle, 1 = active. */
 static volatile int g_workload_state = 0;
@@ -157,7 +157,7 @@ static void cpu_workload_task(void *parameter)
     (void)parameter;
     while (g_experiment_running) {
         if (g_workload_state == 0) {
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
         TickType_t cycle_start = xTaskGetTickCount();
@@ -189,11 +189,11 @@ static void measurement_task(void *parameter)
         int16_t shunt_signed = (int16_t)shunt_raw;
         int16_t current_signed = (int16_t)current_raw;
         float shunt_voltage_mv =
-            shunt_signed * SHUNT_LSB_V * 1000.0f;
+            - shunt_signed * SHUNT_LSB_V * 1000.0f;
         float bus_voltage_v =
             bus_raw * BUS_LSB_V;
         float current_ma =
-            current_signed * CURRENT_LSB_A * 1000.0f;
+            - current_signed * CURRENT_LSB_A * 1000.0f;
         float power_mw =
             power_raw * POWER_LSB_W * 1000.0f;
         int64_t timestamp_ms =
