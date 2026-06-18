@@ -32,7 +32,7 @@
 #define ACTIVE_DURATION_MS      20000
 #define FINAL_IDLE_MS           10000
 #define WORKLOAD_CYCLE_MS       100
-#define WORKLOAD_BUSY_MS        50
+#define WORKLOAD_BUSY_MS        99
 #define MEASUREMENT_INTERVAL_MS 20
 
 /* 0 = idle, 1 = active. */
@@ -151,7 +151,7 @@ static void run_cpu_busy_period(void)
     }
 }
 
-/* Medium intensity: 50 ms busy in each 100 ms cycle. */
+/* High intensity: 100 ms busy in each 100 ms cycle. */
 static void cpu_workload_task(void *parameter)
 {
     (void)parameter;
@@ -233,10 +233,10 @@ void app_main(void)
         printf("INA226 init failed: %s\n", esp_err_to_name(err));
         return;
     }
-    printf("# experiment=first_measurement\n");
+    printf("# experiment=cpu_only_100busy_step\n");
     printf("# composition=CPU_only\n");
     printf("# task_type=fixed_integer_arithmetic\n");
-    printf("# intensity=medium\n");
+    printf("# intensity=high_100busy\n");
     printf("# workload_core=1\n");
     printf("# busy_ms=%d\n", WORKLOAD_BUSY_MS);
     printf("# cycle_ms=%d\n", WORKLOAD_CYCLE_MS);
