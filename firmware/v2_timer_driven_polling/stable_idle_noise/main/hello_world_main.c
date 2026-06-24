@@ -43,7 +43,7 @@
 /* ---------------- Experiment settings ---------------- */
 
 #define STABLE_IDLE_DURATION_MS 60000
-#define MEASUREMENT_INTERVAL_MS 20
+#define MEASUREMENT_INTERVAL_MS 1
 
 #define SAMPLE_QUEUE_LENGTH     2048
 

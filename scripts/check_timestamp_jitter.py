@@ -4,7 +4,7 @@ import os
 import sys
 import statistics
 
-EXPECTED_DT_US = 20000
+EXPECTED_DT_US = 5000
 
 def analyze_file(path):
     timestamps = []
