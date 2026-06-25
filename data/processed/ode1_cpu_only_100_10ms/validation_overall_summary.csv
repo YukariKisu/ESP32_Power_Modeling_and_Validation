@@ -1,0 +1,2 @@
+n_runs,P_idle_mW,K_mW,P_active_model_mW,full_MAE_mean_mW,full_RMSE_mean_mW,full_mean_error_mean_mW,plateau_only_MAE_mean_mW,plateau_only_RMSE_mean_mW,plateau_only_mean_error_mean_mW,active_window_MAE_mean_mW,idle_window_MAE_mean_mW
+10,168.956222,51.321679166018875,220.27790116601886,1.6860508310371372,4.883985271288865,-0.10925609153231368,1.7142279621331675,5.042942298078578,-0.10995030209883812,2.065110834258756,1.3068012030015006
