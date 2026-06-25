@@ -1,0 +1,2 @@
+P_idle_mW,K_mean_mW,K_sd_mW,K_min_mW,K_max_mW,mean_power_cpu_100_stable_overall_mW,sd_between_runs_power_cpu_100_stable_mW,n_runs
+168.956222,51.321679166018875,0.20183160466621738,50.998664174347596,51.547664729594686,220.27790116601886,0.20183160466621738,10
