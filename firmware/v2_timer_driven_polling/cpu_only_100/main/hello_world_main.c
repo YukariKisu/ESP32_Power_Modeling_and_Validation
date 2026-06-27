@@ -49,7 +49,7 @@
 #define WORKLOAD_CYCLE_MS       100
 #define WORKLOAD_BUSY_MS        99
 
-#define MEASUREMENT_INTERVAL_MS 1
+#define MEASUREMENT_INTERVAL_MS 10
 
 // Queue length
 #define SAMPLE_QUEUE_LENGTH     2048
