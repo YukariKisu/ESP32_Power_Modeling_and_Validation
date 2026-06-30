@@ -1,3 +1,8 @@
 
 **/build/
 **/sdkconfig.old
+# PPK2 project/binary files
+*.ppk2
+
+# Raw PPK2 measurement CSV files
+data/raw/v3_ppk/cpu_100/*.csv

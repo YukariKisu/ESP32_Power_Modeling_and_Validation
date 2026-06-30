@@ -28,7 +28,7 @@
    1 = use marker for timing check
    0 = no marker for official measurement
 */
-#define USE_MARKER              1
+#define USE_MARKER              0
 #define MARKER_GPIO             25
 
 /* 0 = idle, 1 = active */
