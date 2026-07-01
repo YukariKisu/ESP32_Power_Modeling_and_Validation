@@ -64,8 +64,9 @@ def load_ppk2_csv(csv_path):
     # PPK2 current: uA -> mA
     current_mA = current_raw / 1000.0
 
-    # Downsample: 100 kS/s -> about 1 kS/s
-    step = 100
+    # Downsample: 100 kS/s -> about 10 kS/s
+    # 0.1 ms interval
+    step = 10
 
     return (
         time_s.iloc[::step].reset_index(drop=True),
@@ -134,7 +135,7 @@ def detect_active_edges(time_s, current_mA):
 
 # Common relative time axis
 # active start = 0 s
-aligned_grid = np.arange(-10.0, 30.0, 0.01)
+aligned_grid = np.arange(-10.0, 30.0, 0.0001)
 
 aligned_currents = []
 summary_rows = []
