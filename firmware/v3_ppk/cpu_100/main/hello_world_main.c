@@ -15,8 +15,9 @@
 #define INITIAL_IDLE_MS         10000
 #define ACTIVE_DURATION_MS      20000
 #define FINAL_IDLE_MS           10000
+#define WORKLOAD_CYCLE_US       1000000
 
-#define WORKLOAD_DUTY_PERCENT   75
+#define WORKLOAD_DUTY_PERCENT   10
 #define CONTROL_INTERVAL_US     5
 
 #define EXPECTED_CPU_FREQ_HZ    240000000UL
@@ -112,7 +113,7 @@ static void cpu_workload_task(void *parameter)
 #else
 
 
-        const uint32_t cycle_us = 100000;
+        const uint32_t cycle_us = WORKLOAD_CYCLE_US;
         const uint32_t busy_us =
             (cycle_us * WORKLOAD_DUTY_PERCENT) / 100;
 
@@ -147,6 +148,7 @@ void app_main(void)
     printf("# expected_cpu_freq_hz=%lu\n", (unsigned long)EXPECTED_CPU_FREQ_HZ);
     printf("# workload_core=%d\n", WORKLOAD_CORE);
     printf("# workload_duty_percent=%d\n", WORKLOAD_DUTY_PERCENT);
+    printf("# workload_cycle_us=%d\n", WORKLOAD_CYCLE_US);
     printf("# control_interval_us=%d\n", CONTROL_INTERVAL_US);
     printf("# initial_idle_ms=%d\n", INITIAL_IDLE_MS);
     printf("# active_duration_ms=%d\n", ACTIVE_DURATION_MS);
