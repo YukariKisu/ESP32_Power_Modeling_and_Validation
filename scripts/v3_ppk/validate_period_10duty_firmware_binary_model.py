@@ -57,13 +57,21 @@ TRANSIENT_WINDOW_S = (0.0, 0.005)
 PERIODIC_STEADY_WINDOW_S = (0.010, 10.0)
 
 # Smoothing for waveform MAE
-SMOOTH_WINDOW_SAMPLES = 20   # 20 samples at 10 kS/s = about 2 ms
+SMOOTH_WINDOW_SAMPLES = 20  # 20 samples at 10 kS/s = about 2 ms
 
-# The active rising edge is detected by current crossing a threshold,
-# not by GPIO marker. For a first-order step response, midpoint crossing
-# happens about tau * ln(2) after the actual input step.
-USE_EDGE_PHASE_CORRECTION = True
-EDGE_PHASE_CORRECTION_S = TAU_S * np.log(2.0)
+# For estimating binary u(t) from measured current
+# Small smoothing to suppress noise but keep switching edges
+U_DETECT_SMOOTH_WINDOW_S = 0.0005  # 0.5 ms
+U_DETECT_SMOOTH_WINDOW_SAMPLES = int(U_DETECT_SMOOTH_WINDOW_S / GRID_DT_S)
+
+if U_DETECT_SMOOTH_WINDOW_SAMPLES < 1:
+    U_DETECT_SMOOTH_WINDOW_SAMPLES = 1
+
+if U_DETECT_SMOOTH_WINDOW_SAMPLES % 2 == 0:
+    U_DETECT_SMOOTH_WINDOW_SAMPLES += 1
+
+# Threshold between idle-like and active-like current
+U_THRESHOLD_MA = (I_IDLE_MODEL_MA + I_ACTIVE_MODEL_MA) / 2.0
 
 SHOW_PLOTS = False
 
@@ -139,10 +147,12 @@ def smooth_waveform(values, window_samples):
 def detect_active_edges(time_s, current_mA):
     """
     Detect the first CPU100-like busy pulse using a CPU100-derived threshold.
-    This is used only for alignment.
+    This is used for alignment.
     """
 
+    # Smooth current for robust edge detection
     smooth = current_mA.rolling(window=20, center=True, min_periods=1).mean()
+    # window=20 at 10 kS/s -> about 2 ms smoothing
 
     # Detect power-on roughly
     max_level = smooth.quantile(0.99)
@@ -161,8 +171,7 @@ def detect_active_edges(time_s, current_mA):
     if np.isnan(idle_level):
         raise ValueError("Could not estimate idle level")
 
-    # CPU100-derived high-current threshold
-    high_current_threshold = (I_IDLE_MODEL_MA + I_ACTIVE_MODEL_MA) / 2.0
+    high_current_threshold = U_THRESHOLD_MA
 
     # Detect first busy pulse after initial idle
     rising_candidates = np.where(
@@ -179,6 +188,7 @@ def detect_active_edges(time_s, current_mA):
     rising_idx = rising_candidates[0]
     rising_time = time_s.iloc[rising_idx]
 
+    # Estimate active high level using samples above threshold
     active_mask = (
         (time_s > rising_time)
         & (time_s < rising_time + 20)
@@ -187,7 +197,10 @@ def detect_active_edges(time_s, current_mA):
 
     active_level = smooth[active_mask].median()
 
-    # End of active phase is not critical for this validation.
+    if np.isnan(active_level):
+        active_level = np.nan
+
+    # End of active phase is not critical here.
     falling_candidates = np.where(
         (time_s > rising_time + 10)
         & (smooth < high_current_threshold)
@@ -209,36 +222,43 @@ def detect_active_edges(time_s, current_mA):
     )
 
 
-def create_firmware_binary_input(time_grid, duty_percent, cycle_us):
+def estimate_binary_input_from_current(time_grid, measured_current_mA):
     """
-    Create firmware-defined binary input u(t).
+    Estimate u(t) from measured current.
 
-    u(t) = 1 during busy section
-    u(t) = 0 during wait section
+    u(t) = 1 if current looks like CPU100 active state
+    u(t) = 0 if current looks like idle/wait state
+
+    For t < 0, force u(t) = 0.
     """
 
-    cycle_s = cycle_us / 1_000_000.0
-    busy_s = cycle_s * duty_percent / 100.0
-
-    if USE_EDGE_PHASE_CORRECTION:
-        phase_corrected_time = time_grid + EDGE_PHASE_CORRECTION_S
-    else:
-        phase_corrected_time = time_grid.copy()
+    smoothed_for_u = smooth_waveform(
+        measured_current_mA,
+        U_DETECT_SMOOTH_WINDOW_SAMPLES,
+    )
 
     u_t = np.zeros_like(time_grid, dtype=float)
 
-    active_mask = phase_corrected_time >= 0.0
-    phase_in_cycle = np.mod(phase_corrected_time[active_mask], cycle_s)
+    valid_mask = np.isfinite(smoothed_for_u)
+    active_time_mask = time_grid >= 0
 
-    u_t[active_mask] = (phase_in_cycle < busy_s).astype(float)
+    high_mask = (
+        valid_mask
+        & active_time_mask
+        & (smoothed_for_u >= U_THRESHOLD_MA)
+    )
 
-    return u_t
+    u_t[high_mask] = 1.0
+
+    return u_t, smoothed_for_u
 
 
 def simulate_first_order_model_binary_input(time_grid, u_t):
     """
     Simulate:
         dI/dt = (I_idle + gain*u(t) - I) / tau
+
+    Uses exact discrete update for zero-order-hold input.
     """
 
     I_pred = np.full_like(time_grid, np.nan, dtype=float)
@@ -301,10 +321,10 @@ def save_plot_for_condition(
     duty_percent,
     aligned_currents,
     predicted_currents,
-    firmware_inputs,
+    u_inputs,
     mean_measured,
     mean_predicted,
-    mean_firmware_u,
+    mean_u,
     out_dir,
 ):
     cycle_s = cycle_us / 1_000_000.0
@@ -354,7 +374,7 @@ def save_plot_for_condition(
     plt.xlabel("Time from first active start [s]")
     plt.ylabel("Current [mA]")
     plt.title(
-        f"{condition_name}: firmware-defined binary input ODE validation"
+        f"{condition_name}: PPK-estimated binary input ODE validation"
     )
     plt.xlim(-2, 12)
     plt.ylim(40, 90)
@@ -364,7 +384,7 @@ def save_plot_for_condition(
 
     out_plot = os.path.join(
         out_dir,
-        f"{condition_name}_firmware_binary_input_measured_vs_predicted.png",
+        f"{condition_name}_ppk_estimated_binary_input_measured_vs_predicted.png",
     )
 
     plt.savefig(out_plot, dpi=200)
@@ -395,14 +415,15 @@ def save_plot_for_condition(
         label="mean predicted current",
     )
 
-    input_level = I_IDLE_MODEL_MA + GAIN_MODEL_MA * mean_firmware_u
+    # Scale estimated u(t) for visualization
+    u_visual = I_IDLE_MODEL_MA + GAIN_MODEL_MA * mean_u
 
     plt.plot(
         ALIGNED_GRID,
-        input_level,
+        u_visual,
         linewidth=1.5,
         linestyle=":",
-        label="firmware input target level",
+        label="mean estimated input level",
     )
 
     plt.axvline(0, linestyle="--", linewidth=1)
@@ -422,7 +443,7 @@ def save_plot_for_condition(
 
     out_zoom_plot = os.path.join(
         out_dir,
-        f"{condition_name}_firmware_binary_input_zoom.png",
+        f"{condition_name}_ppk_estimated_binary_input_zoom.png",
     )
 
     plt.savefig(out_zoom_plot, dpi=200)
@@ -440,6 +461,7 @@ def save_plot_for_condition(
 # ============================================================
 
 all_summary_rows = []
+skipped_rows = []
 
 for condition in CONDITIONS:
     condition_name = condition["name"]
@@ -467,31 +489,35 @@ for condition in CONDITIONS:
 
     aligned_currents = []
     predicted_currents = []
-    firmware_inputs = []
+    u_inputs = []
 
     run_rows = []
-
-    firmware_u_t = create_firmware_binary_input(
-        ALIGNED_GRID,
-        duty_percent,
-        cycle_us,
-    )
 
     for csv_path in files:
         label = os.path.basename(csv_path).replace(".csv", "")
 
         print(f"Processing: {label}")
 
-        time_s, current_mA = load_ppk2_csv(csv_path)
+        try:
+            time_s, current_mA = load_ppk2_csv(csv_path)
 
-        (
-            power_on_time,
-            rising_time,
-            falling_time,
-            idle_level,
-            active_level,
-            alignment_threshold,
-        ) = detect_active_edges(time_s, current_mA)
+            (
+                power_on_time,
+                rising_time,
+                falling_time,
+                idle_level,
+                active_level,
+                alignment_threshold,
+            ) = detect_active_edges(time_s, current_mA)
+
+        except ValueError as e:
+            print(f"# SKIP {label}: {e}")
+            skipped_rows.append({
+                "condition": condition_name,
+                "run": label,
+                "reason": str(e),
+            })
+            continue
 
         aligned_time = time_s - rising_time
 
@@ -503,9 +529,14 @@ for condition in CONDITIONS:
             right=np.nan,
         )
 
+        u_t, smoothed_for_u = estimate_binary_input_from_current(
+            ALIGNED_GRID,
+            measured_interp,
+        )
+
         predicted_current = simulate_first_order_model_binary_input(
             ALIGNED_GRID,
-            firmware_u_t,
+            u_t,
         )
 
         smoothed_measured = smooth_waveform(
@@ -566,15 +597,15 @@ for condition in CONDITIONS:
             & np.isfinite(measured_interp)
         )
 
-        effective_firmware_duty = (
-            np.mean(firmware_u_t[eval_mask])
+        estimated_duty = (
+            np.mean(u_t[eval_mask])
             if np.sum(eval_mask) > 0
             else np.nan
         )
 
         aligned_currents.append(measured_interp)
         predicted_currents.append(predicted_current)
-        firmware_inputs.append(firmware_u_t)
+        u_inputs.append(u_t)
 
         run_rows.append({
             "run": label,
@@ -585,7 +616,8 @@ for condition in CONDITIONS:
             "period_ms": period_ms,
             "busy_ms": busy_ms,
             "idle_ms": idle_ms,
-            "effective_firmware_duty_in_eval_window": effective_firmware_duty,
+
+            "estimated_duty_from_current": estimated_duty,
 
             "power_on_time_s": power_on_time,
             "active_start_time_s": rising_time,
@@ -595,8 +627,8 @@ for condition in CONDITIONS:
             "alignment_active_level_mA": active_level,
             "alignment_threshold_mA": alignment_threshold,
 
-            "use_edge_phase_correction": USE_EDGE_PHASE_CORRECTION,
-            "edge_phase_correction_s": EDGE_PHASE_CORRECTION_S,
+            "u_threshold_mA": U_THRESHOLD_MA,
+            "u_detect_smooth_window_samples": U_DETECT_SMOOTH_WINDOW_SAMPLES,
 
             "raw_mae_full_0_to_10s_mA": raw_mae_full,
             "raw_mae_transient_0_to_5ms_mA": raw_mae_transient,
@@ -614,10 +646,11 @@ for condition in CONDITIONS:
         debug_df = pd.DataFrame({
             "time_from_first_active_start_s": ALIGNED_GRID,
             "measured_current_mA": measured_interp,
-            "smoothed_measured_current_mA": smoothed_measured,
-            "firmware_u_t": firmware_u_t,
-            "firmware_input_target_current_mA": I_IDLE_MODEL_MA + GAIN_MODEL_MA * firmware_u_t,
+            "smoothed_current_for_u_detection_mA": smoothed_for_u,
+            "estimated_u_t": u_t,
+            "estimated_input_target_current_mA": I_IDLE_MODEL_MA + GAIN_MODEL_MA * u_t,
             "predicted_current_mA": predicted_current,
+            "smoothed_measured_current_mA": smoothed_measured,
             "smoothed_predicted_current_mA": smoothed_predicted,
             "prediction_error_mA": measured_interp - predicted_current,
             "smoothed_prediction_error_mA": smoothed_measured - smoothed_predicted,
@@ -625,38 +658,42 @@ for condition in CONDITIONS:
 
         out_debug = os.path.join(
             out_dir,
-            f"{label}_firmware_binary_input_debug_waveform.csv",
+            f"{label}_ppk_estimated_binary_input_debug_waveform.csv",
         )
         debug_df.to_csv(out_debug, index=False)
 
     run_df = pd.DataFrame(run_rows)
 
+    if run_df.empty:
+        print(f"# No valid runs for {condition_name}")
+        continue
+
     out_run_summary = os.path.join(
         out_dir,
-        f"{condition_name}_firmware_binary_input_validation_by_run.csv",
+        f"{condition_name}_ppk_estimated_binary_input_validation_by_run.csv",
     )
     run_df.to_csv(out_run_summary, index=False)
 
     aligned_array = np.array(aligned_currents)
     predicted_array = np.array(predicted_currents)
-    firmware_u_array = np.array(firmware_inputs)
+    u_array = np.array(u_inputs)
 
     mean_measured = np.nanmean(aligned_array, axis=0)
     mean_predicted = np.nanmean(predicted_array, axis=0)
-    mean_firmware_u = np.nanmean(firmware_u_array, axis=0)
+    mean_u = np.nanmean(u_array, axis=0)
 
     mean_df = pd.DataFrame({
         "time_from_first_active_start_s": ALIGNED_GRID,
         "mean_measured_current_mA": mean_measured,
         "mean_predicted_current_mA": mean_predicted,
-        "mean_firmware_u_t": mean_firmware_u,
-        "mean_firmware_input_target_current_mA": I_IDLE_MODEL_MA + GAIN_MODEL_MA * mean_firmware_u,
+        "mean_estimated_u_t": mean_u,
+        "mean_estimated_input_level_mA": I_IDLE_MODEL_MA + GAIN_MODEL_MA * mean_u,
         "mean_prediction_error_mA": mean_measured - mean_predicted,
     })
 
     out_mean = os.path.join(
         out_dir,
-        f"{condition_name}_firmware_binary_input_mean_waveform.csv",
+        f"{condition_name}_ppk_estimated_binary_input_mean_waveform.csv",
     )
     mean_df.to_csv(out_mean, index=False)
 
@@ -666,10 +703,10 @@ for condition in CONDITIONS:
         duty_percent=duty_percent,
         aligned_currents=aligned_currents,
         predicted_currents=predicted_currents,
-        firmware_inputs=firmware_inputs,
+        u_inputs=u_inputs,
         mean_measured=mean_measured,
         mean_predicted=mean_predicted,
-        mean_firmware_u=mean_firmware_u,
+        mean_u=mean_u,
         out_dir=out_dir,
     )
 
@@ -681,10 +718,13 @@ for condition in CONDITIONS:
         "period_ms": period_ms,
         "busy_ms": busy_ms,
         "idle_ms": idle_ms,
-        "n_runs": len(files),
+        "n_valid_runs": len(run_df),
+        "n_skipped_runs": sum(
+            1 for row in skipped_rows if row["condition"] == condition_name
+        ),
 
-        "effective_firmware_duty_in_eval_window_mean": run_df["effective_firmware_duty_in_eval_window"].mean(),
-        "effective_firmware_duty_in_eval_window_std": run_df["effective_firmware_duty_in_eval_window"].std(ddof=1),
+        "mean_estimated_duty_from_current": run_df["estimated_duty_from_current"].mean(),
+        "std_estimated_duty_from_current": run_df["estimated_duty_from_current"].std(ddof=1),
 
         "mean_raw_mae_full_0_to_10s_mA": run_df["raw_mae_full_0_to_10s_mA"].mean(),
         "std_raw_mae_full_0_to_10s_mA": run_df["raw_mae_full_0_to_10s_mA"].std(ddof=1),
@@ -724,18 +764,31 @@ summary_df = pd.DataFrame(all_summary_rows)
 
 out_summary = os.path.join(
     BASE_OUT_DIR,
-    "period_10duty_firmware_binary_input_validation_summary.csv",
+    "period_10duty_ppk_estimated_binary_input_validation_summary.csv",
 )
 
 summary_df.to_csv(out_summary, index=False)
 
+if skipped_rows:
+    skipped_df = pd.DataFrame(skipped_rows)
+    out_skipped = os.path.join(
+        BASE_OUT_DIR,
+        "period_10duty_ppk_estimated_binary_input_skipped_runs.csv",
+    )
+    skipped_df.to_csv(out_skipped, index=False)
+else:
+    out_skipped = None
+
 print("\n" + "=" * 70)
-print("Combined period 10% duty firmware-defined binary-input validation summary")
+print("Combined period 10% duty PPK-estimated binary-input validation summary")
 print("=" * 70)
 print(summary_df)
 
 print("\nSaved:")
 print(out_summary)
+
+if out_skipped is not None:
+    print(out_skipped)
 
 compact_cols = [
     "condition",
@@ -743,7 +796,9 @@ compact_cols = [
     "period_ms",
     "busy_ms",
     "idle_ms",
-    "effective_firmware_duty_in_eval_window_mean",
+    "n_valid_runs",
+    "n_skipped_runs",
+    "mean_estimated_duty_from_current",
     "mean_raw_mae_full_0_to_10s_mA",
     "mean_raw_mae_periodic_steady_10ms_to_10s_mA",
     "mean_smoothed_mae_full_0_to_10s_mA",
