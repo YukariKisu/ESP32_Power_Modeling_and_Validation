@@ -53,21 +53,35 @@ def load_condition_data(condition):
     processed_dir = condition["processed_dir"]
 
     # Use firmware-defined debug files first.
-    pattern = os.path.join(
-        processed_dir,
-        "*_firmware_binary_input_debug_waveform.csv",
-    )
+    patterns = [
+        os.path.join(processed_dir, "*_firmware_binary_input_debug_waveform.csv"),
+        os.path.join(processed_dir, "*_ppk_estimated_binary_input_debug_waveform.csv"),
+    ]
 
-    files = sorted(glob.glob(pattern))
+    files = []
+
+    for pattern in patterns:
+        files = sorted(glob.glob(pattern))
+        if files:
+            print(f"Using debug waveform files: {pattern}")
+            break
 
     if not files:
-        raise FileNotFoundError(f"No debug waveform files found: {pattern}")
+        raise FileNotFoundError(
+            "No debug waveform files found. Tried:\n"
+            + "\n".join(patterns)
+        )
 
     rows = []
 
     for path in files:
-        run_name = os.path.basename(path).replace(
+        base = os.path.basename(path)
+
+        run_name = base.replace(
             "_firmware_binary_input_debug_waveform.csv",
+            "",
+        ).replace(
+            "_ppk_estimated_binary_input_debug_waveform.csv",
             "",
         )
 

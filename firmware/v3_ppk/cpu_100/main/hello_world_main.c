@@ -4,70 +4,38 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
-#include "driver/gpio.h"
+#include "freertos/portmacro.h"
 
 #include "sdkconfig.h"
 #include "esp_cpu.h"
 
 /* ---------------- Experiment settings ---------------- */
 
-#define INITIAL_IDLE_MS         10000
-#define ACTIVE_DURATION_MS      20000
-#define FINAL_IDLE_MS           10000
-#define WORKLOAD_CYCLE_US       1000000
+#define INITIAL_IDLE_MS             10000
+#define FINAL_IDLE_MS               10000
 
-#define WORKLOAD_DUTY_PERCENT   10
-#define CONTROL_INTERVAL_US     5
+/* Clean rise section */
+#define INTERRUPT_DISABLED_PULSE_US 10000    // 10 ms
 
-#define EXPECTED_CPU_FREQ_HZ    240000000UL
+/* Normal busy plateau after the clean rise */
+#define ACTIVE_PLATEAU_US           100000   // 100 ms
+
+#define CONTROL_INTERVAL_US         5
+
+#define EXPECTED_CPU_FREQ_HZ        240000000UL
 #define CPU_FREQ_HZ ((uint32_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000000UL)
 
-#define WORKLOAD_CORE           1
+/* Match original CPU100 training condition */
+#define WORKLOAD_CORE               1
 
-/* GPIO marker:
-   1 = use marker for timing check
-   0 = no marker for official measurement
-*/
-#define USE_MARKER              0
-#define MARKER_GPIO             25
-
-/* 0 = idle, 1 = active */
-static volatile int g_workload_state = 0;
-static volatile bool g_experiment_running = true;
+/* Experiment state */
+static volatile bool g_experiment_done = false;
 
 /* Prevent optimization */
 static volatile uint32_t g_workload_result = 1;
 
-/* ---------------- GPIO marker ---------------- */
 
-static void marker_init(void)
-{
-#if USE_MARKER
-    gpio_config_t io_conf = {
-        .pin_bit_mask = 1ULL << MARKER_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-
-    gpio_config(&io_conf);
-    gpio_set_level(MARKER_GPIO, 0);
-#endif
-}
-
-static inline void marker_set(int level)
-{
-#if USE_MARKER
-    gpio_set_level(MARKER_GPIO, level);
-#else
-    (void)level;
-#endif
-}
-
-
-/* ---------------- CCOUNT workload control ---------------- */
+/* ---------------- CCOUNT workload ---------------- */
 
 static inline void do_workload_operation(void)
 {
@@ -89,87 +57,105 @@ static void run_busy_ccount_us(uint32_t busy_us)
     }
 }
 
-/* ---------------- Workload task on Core 1 ---------------- */
+static void run_busy_plateau_us(uint32_t plateau_us)
+{
+    uint32_t target_cycles =
+        (uint32_t)(((uint64_t)CPU_FREQ_HZ * plateau_us) / 1000000ULL);
 
-static void cpu_workload_task(void *parameter)
+    uint32_t start_cycles = esp_cpu_get_cycle_count();
+
+    while ((uint32_t)(esp_cpu_get_cycle_count() - start_cycles) < target_cycles) {
+        run_busy_ccount_us(CONTROL_INTERVAL_US);
+
+        /*
+           Interrupts are enabled here.
+           Yield occasionally so the system remains stable.
+        */
+        taskYIELD();
+    }
+}
+
+
+/* ---------------- Workload task ---------------- */
+
+static void interrupt_disabled_clean_rise_task(void *parameter)
 {
     (void)parameter;
 
-    while (g_experiment_running) {
+    /*
+       Part 1:
+       Interrupt-disabled clean rise.
+       This is the section used for tau_rise estimation.
+    */
+    portDISABLE_INTERRUPTS();
 
-        if (g_workload_state == 0) {
+    run_busy_ccount_us(INTERRUPT_DISABLED_PULSE_US);
 
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
+    portENABLE_INTERRUPTS();
 
-#if WORKLOAD_DUTY_PERCENT == 100
+    /*
+       Part 2:
+       Normal busy plateau.
+       This makes the waveform easier to identify,
+       but tau_rise should still be estimated from the first 10 ms.
+    */
+    run_busy_plateau_us(ACTIVE_PLATEAU_US);
 
-
-        while (g_experiment_running && g_workload_state == 1) {
-            run_busy_ccount_us(CONTROL_INTERVAL_US);
-        }
-
-#else
-
-
-        const uint32_t cycle_us = WORKLOAD_CYCLE_US;
-        const uint32_t busy_us =
-            (cycle_us * WORKLOAD_DUTY_PERCENT) / 100;
-
-        while (g_experiment_running && g_workload_state == 1) {
-            run_busy_ccount_us(busy_us);
-
-            uint32_t idle_us = cycle_us - busy_us;
-
-            if (idle_us >= 1000) {
-                vTaskDelay(pdMS_TO_TICKS(idle_us / 1000));
-            } else {
-                taskYIELD();
-            }
-        }
-
-#endif
-    }
+    g_experiment_done = true;
 
     vTaskDelete(NULL);
 }
 
-/* ---------------- Main experiment ---------------- */
+
 
 void app_main(void)
 {
     uint32_t cpu_freq_hz = CPU_FREQ_HZ;
 
-    printf("# experiment=ppk2_cpu_only_transient\n");
+    printf("# experiment=ppk2_cpu100_interrupt_disabled_clean_rise_with_plateau\n");
     printf("# measurement_device=PPK2\n");
     printf("# internal_current_sensor=disabled\n");
+    printf("# purpose=tau_rise_estimation_clean_step_response\n");
+
     printf("# cpu_freq_hz=%lu\n", (unsigned long)cpu_freq_hz);
     printf("# expected_cpu_freq_hz=%lu\n", (unsigned long)EXPECTED_CPU_FREQ_HZ);
+
     printf("# workload_core=%d\n", WORKLOAD_CORE);
-    printf("# workload_duty_percent=%d\n", WORKLOAD_DUTY_PERCENT);
-    printf("# workload_cycle_us=%d\n", WORKLOAD_CYCLE_US);
+    printf("# interrupt_disabled_pulse_us=%d\n", INTERRUPT_DISABLED_PULSE_US);
+    printf("# active_plateau_us=%d\n", ACTIVE_PLATEAU_US);
     printf("# control_interval_us=%d\n", CONTROL_INTERVAL_US);
+
     printf("# initial_idle_ms=%d\n", INITIAL_IDLE_MS);
-    printf("# active_duration_ms=%d\n", ACTIVE_DURATION_MS);
     printf("# final_idle_ms=%d\n", FINAL_IDLE_MS);
-    printf("# use_marker=%d\n", USE_MARKER);
-    printf("# marker_gpio=%d\n", MARKER_GPIO);
+
+    printf("# gpio_marker=disabled\n");
 
     if (cpu_freq_hz != EXPECTED_CPU_FREQ_HZ) {
         printf("# WARNING: CPU frequency is not 240MHz\n");
     }
 
-    marker_init();
+    g_experiment_done = false;
 
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
-    g_workload_state = 0;
-    g_experiment_running = true;
+    printf("# phase=initial_idle\n");
+    vTaskDelay(pdMS_TO_TICKS(INITIAL_IDLE_MS));
 
+    printf("# phase=interrupt_disabled_clean_rise_then_busy_plateau\n");
+
+    /*
+       Give UART a short time to finish printing before the clean pulse starts.
+    */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /*
+       Create workload task only after the initial idle phase.
+       This prevents the workload task from waking up during initial idle.
+    */
     BaseType_t workload_created =
         xTaskCreatePinnedToCore(
-            cpu_workload_task,
-            "cpu_workload_task",
+            interrupt_disabled_clean_rise_task,
+            "clean_rise_task",
             4096,
             NULL,
             5,
@@ -182,27 +168,14 @@ void app_main(void)
         return;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    printf("# phase=initial_idle\n");
-    g_workload_state = 0;
-    marker_set(0);
-    vTaskDelay(pdMS_TO_TICKS(INITIAL_IDLE_MS));
-
-    printf("# phase=active\n");
-    g_workload_state = 1;
-    marker_set(1);
-    vTaskDelay(pdMS_TO_TICKS(ACTIVE_DURATION_MS));
+    while (!g_experiment_done) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
 
     printf("# phase=final_idle\n");
-    g_workload_state = 0;
-    marker_set(0);
     vTaskDelay(pdMS_TO_TICKS(FINAL_IDLE_MS));
-
-    g_experiment_running = false;
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
 
     printf("# experiment_complete\n");
     printf("# workload_result=%lu\n", (unsigned long)g_workload_result);
 }
+

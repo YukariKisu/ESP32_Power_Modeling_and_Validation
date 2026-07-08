@@ -2,7 +2,7 @@
 **/sdkconfig.old
 
 # PPK2 generated measurement files under v3_ppk workload folders
-data/raw/v3_ppk/*/*.csv
-data/raw/v3_ppk/*/*.ppk2
-data/processed/v3_ppk/*/*.csv
-data/processed/v3_ppk/*/*.ppk2
+data/raw/v3_ppk/**/*.csv
+data/raw/v3_ppk/**/*.ppk2
+data/processed/v3_ppk/**/*.csv
+data/processed/v3_ppk/**/*.ppk2
