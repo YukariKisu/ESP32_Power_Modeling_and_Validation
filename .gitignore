@@ -6,3 +6,11 @@ data/raw/v3_ppk/**/*.csv
 data/raw/v3_ppk/**/*.ppk2
 data/processed/v3_ppk/**/*.csv
 data/processed/v3_ppk/**/*.ppk2
+
+# Generated analysis results
+results/v3_ppk/**/*.csv
+results/v3_ppk/**/*.png
+results/v3_ppk/**/*.ppk2
+
+# keep compact summary CSVs
+!results/v3_ppk/**/summary_*.csv
