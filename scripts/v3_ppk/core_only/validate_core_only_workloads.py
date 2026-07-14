@@ -72,6 +72,13 @@ WORKLOADS = {
             "cpu_100_mixRAMarith/*.csv"
         ),
     },
+    "memory_integer_float_bit": {
+        "label": "Memory + integer + floating point + bit operations",
+        "pattern": (
+            "data/raw/v3_ppk/cpu_maximum/"
+            "cpu_100_4comb/*.csv"
+        ),
+    },
 }
 
 

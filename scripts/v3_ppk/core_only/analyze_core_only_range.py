@@ -1,5 +1,4 @@
 import glob
-import os
 import re
 from pathlib import Path
 
@@ -18,13 +17,16 @@ OUT_ROOT = Path("data/processed/v3_ppk/core_only_range")
 MAX_ROOT = RAW_ROOT / "cpu_maximum"
 MIN_ROOT = RAW_ROOT / "cpu_minimum"
 
-# Existing arithmetic-loop baseline.
-# Change this pattern if the actual location or filenames differ.
+# Existing arithmetic-loop baseline
 ARITHMETIC_PATTERN = (
     "data/raw/v3_ppk/cpu_100/ppk_cpu_100_run*.csv"
 )
 
-# Experiment timing relative to the detected active rising edge.
+# Board-level correction
+# CH340C typical operating total supply current from datasheet
+CH340C_TYP_CURRENT_MA = 4.0
+
+# Experiment timing relative to the detected active rising edge
 INITIAL_IDLE_START_S = -9.0
 INITIAL_IDLE_END_S = -1.0
 
@@ -35,16 +37,15 @@ FINAL_IDLE_START_S = 21.0
 FINAL_IDLE_END_S = 29.0
 
 # Expected waveform:
-# -10 to 0 s: initial idle
-#   0 to 20 s: active
-#  20 to 30 s: final idle
+# approximately:
+#   0 to 1 s: setup after app starts
+#   1 to 11 s: initial idle
+#  11 to 31 s: active
+#  31 to 41 s: final idle
+EXPECTED_ACTIVE_START_AFTER_POWER_ON_S = 11.0
+EXPECTED_ACTIVE_DURATION_S = 20.0
 
 DOWNSAMPLE_STEP = 10
-
-# Approximate common time grid after alignment.
-ALIGNED_START_S = -10.0
-ALIGNED_END_S = 30.0
-ALIGNED_INTERVAL_S = 0.0001
 
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -68,7 +69,15 @@ def normalize_workload_name(folder_name):
         "cpu_100_seqRAM": "Sequential RAM read/write",
         "cpu_100_largeRAMcopy": "Large-buffer RAM copy",
         "cpu_100_mixRAMarith": "Mixed RAM + arithmetic",
+        "cpu_100_4comb": "Memory + integer + floating point + bit operations",
         "cpu_100_arithmetic": "Arithmetic loop",
+
+        # Minimum-side NOP workload folder names
+        "cpu_100_nop": "NOP loop",
+        "cpu_minimum_nop": "NOP loop",
+        "minimum_nop": "NOP loop",
+        "nop_loop": "NOP loop",
+        "ppk2_cpu_only_minimum_nop_100": "NOP loop",
     }
 
     return name_map.get(
@@ -148,12 +157,29 @@ def load_ppk2_csv(csv_path):
 # Active-edge detection
 # ============================================================
 
+def estimate_power_on_time(time_s, smooth_current_mA):
+    """Estimate power-on time from the current waveform."""
+    max_level = smooth_current_mA.quantile(0.99)
+    power_threshold = max_level * 0.1
+
+    candidates = np.where(smooth_current_mA > power_threshold)[0]
+
+    if len(candidates) == 0:
+        raise ValueError("Could not detect power-on")
+
+    return float(time_s.iloc[candidates[0]])
+
+
 def detect_active_edges(time_s, current_mA):
     """
     Detect active rising and falling edges.
 
-    The smoothing and time windows assume:
-    approximately 10 s idle, 20 s active, 10 s idle.
+    This is designed for:
+        initial idle -> active -> final idle
+
+    For NOP loop, the active step may be smaller than the maximum
+    workloads. Therefore, this function first tries threshold-based
+    detection and then falls back to expected timing if needed.
     """
     smooth = current_mA.rolling(
         window=200,
@@ -161,15 +187,7 @@ def detect_active_edges(time_s, current_mA):
         min_periods=1,
     ).mean()
 
-    max_level = smooth.quantile(0.99)
-    power_threshold = max_level * 0.1
-
-    power_candidates = np.where(smooth > power_threshold)[0]
-
-    if len(power_candidates) == 0:
-        raise ValueError("Could not detect power-on")
-
-    power_on_time = float(time_s.iloc[power_candidates[0]])
+    power_on_time = estimate_power_on_time(time_s, smooth)
 
     idle_mask = (
         (time_s > power_on_time + 3.0)
@@ -191,27 +209,55 @@ def detect_active_edges(time_s, current_mA):
 
     threshold = (idle_level + active_level) / 2.0
 
-    rising_candidates = np.where(
-        (time_s > power_on_time + 5.0)
-        & (smooth > threshold)
-    )[0]
+    expected_rising_time = (
+        power_on_time + EXPECTED_ACTIVE_START_AFTER_POWER_ON_S
+    )
+
+    expected_falling_time = (
+        expected_rising_time + EXPECTED_ACTIVE_DURATION_S
+    )
+
+    # Search around the expected rising edge.
+    rising_search_mask = (
+        (time_s > expected_rising_time - 4.0)
+        & (time_s < expected_rising_time + 4.0)
+    )
+
+    if active_level >= idle_level:
+        rising_candidates = np.where(
+            rising_search_mask & (smooth > threshold)
+        )[0]
+    else:
+        rising_candidates = np.array([], dtype=int)
 
     if len(rising_candidates) == 0:
-        raise ValueError("Could not detect active rising edge")
+        rising_time = expected_rising_time
+        edge_detection_method = "expected_timing_fallback"
+    else:
+        rising_idx = int(rising_candidates[0])
+        rising_time = float(time_s.iloc[rising_idx])
+        edge_detection_method = "threshold"
 
-    rising_idx = int(rising_candidates[0])
-    rising_time = float(time_s.iloc[rising_idx])
-
-    falling_candidates = np.where(
+    # Search falling edge after rising edge.
+    falling_search_mask = (
         (time_s > rising_time + 10.0)
-        & (smooth < threshold)
-    )[0]
+        & (time_s < rising_time + 30.0)
+    )
+
+    if active_level >= idle_level:
+        falling_candidates = np.where(
+            falling_search_mask & (smooth < threshold)
+        )[0]
+    else:
+        falling_candidates = np.array([], dtype=int)
 
     if len(falling_candidates) == 0:
-        falling_time = np.nan
+        falling_time = expected_falling_time
+        falling_detection_method = "expected_timing_fallback"
     else:
         falling_idx = int(falling_candidates[0])
         falling_time = float(time_s.iloc[falling_idx])
+        falling_detection_method = "threshold"
 
     return {
         "power_on_time_s": power_on_time,
@@ -220,6 +266,8 @@ def detect_active_edges(time_s, current_mA):
         "detected_idle_level_mA": idle_level,
         "detected_active_level_mA": active_level,
         "threshold_mA": threshold,
+        "edge_detection_method": edge_detection_method,
+        "falling_detection_method": falling_detection_method,
     }
 
 
@@ -298,12 +346,9 @@ def analyze_single_run(csv_path, workload, category):
 
     falling_time = edge_info["falling_time_s"]
 
-    if np.isnan(falling_time):
-        active_duration_s = np.nan
-    else:
-        active_duration_s = (
-            falling_time - edge_info["rising_time_s"]
-        )
+    active_duration_s = (
+        falling_time - edge_info["rising_time_s"]
+    )
 
     return {
         "category": category,
@@ -315,6 +360,8 @@ def analyze_single_run(csv_path, workload, category):
         "active_start_time_s": edge_info["rising_time_s"],
         "active_end_time_s": falling_time,
         "active_duration_s": active_duration_s,
+        "edge_detection_method": edge_info["edge_detection_method"],
+        "falling_detection_method": edge_info["falling_detection_method"],
 
         "initial_idle_mean_mA": initial_idle["mean"],
         "initial_idle_median_mA": initial_idle["median"],
@@ -336,7 +383,27 @@ def analyze_single_run(csv_path, workload, category):
         "delta_mean_mA": delta_mean_mA,
         "delta_median_mA": delta_median_mA,
 
+        # CH340C-corrected absolute-current estimates.
+        # Delta does not change because the same offset is subtracted
+        # from both idle and active current.
+        "ch340c_typ_current_mA": CH340C_TYP_CURRENT_MA,
+        "initial_idle_mean_corrected_mA": (
+            initial_idle["mean"] - CH340C_TYP_CURRENT_MA
+        ),
+        "active_mean_corrected_mA": (
+            active["mean"] - CH340C_TYP_CURRENT_MA
+        ),
+        "final_idle_mean_corrected_mA": (
+            final_idle["mean"] - CH340C_TYP_CURRENT_MA
+        ),
+        "idle_baseline_mean_corrected_mA": (
+            idle_baseline_mean - CH340C_TYP_CURRENT_MA
+        ),
+        "delta_mean_corrected_mA": delta_mean_mA,
+
         "threshold_mA": edge_info["threshold_mA"],
+        "detected_idle_level_mA": edge_info["detected_idle_level_mA"],
+        "detected_active_level_mA": edge_info["detected_active_level_mA"],
     }
 
 
@@ -381,7 +448,7 @@ def discover_category_datasets(root_dir, category):
 
 
 def discover_datasets():
-    """Discover arithmetic baseline, Max datasets and Min datasets."""
+    """Discover arithmetic baseline, maximum datasets, and minimum datasets."""
     datasets = []
 
     arithmetic_files = sorted(
@@ -464,6 +531,19 @@ def aggregate_workloads(run_df):
                 "active_std_mA",
                 "mean",
             ),
+
+            idle_mean_corrected_mA=(
+                "idle_baseline_mean_corrected_mA",
+                "mean",
+            ),
+            active_mean_corrected_mA=(
+                "active_mean_corrected_mA",
+                "mean",
+            ),
+            delta_mean_corrected_mA=(
+                "delta_mean_corrected_mA",
+                "mean",
+            ),
         )
     )
 
@@ -487,9 +567,117 @@ def aggregate_workloads(run_df):
         .astype(int)
     )
 
+    workload_df["active_low_current_rank"] = (
+        workload_df
+        .groupby("category")["active_mean_mA"]
+        .rank(
+            method="min",
+            ascending=True,
+        )
+        .astype(int)
+    )
+
+    workload_df["delta_low_current_rank"] = (
+        workload_df
+        .groupby("category")["delta_mean_mA"]
+        .rank(
+            method="min",
+            ascending=True,
+        )
+        .astype(int)
+    )
+
     return workload_df.sort_values(
         ["category", "active_rank", "workload"]
     ).reset_index(drop=True)
+
+
+# ============================================================
+# Operating range summary
+# ============================================================
+
+def build_operating_range_summary(workload_df):
+    """Build core-only operating range summary."""
+    maximum_df = workload_df[
+        workload_df["category"] == "maximum"
+    ].copy()
+
+    minimum_df = workload_df[
+        workload_df["category"] == "minimum"
+    ].copy()
+
+    if maximum_df.empty or minimum_df.empty:
+        return pd.DataFrame()
+
+    max_active_row = maximum_df.sort_values(
+        "active_mean_mA",
+        ascending=False,
+    ).iloc[0]
+
+    max_delta_row = maximum_df.sort_values(
+        "delta_mean_mA",
+        ascending=False,
+    ).iloc[0]
+
+    min_active_row = minimum_df.sort_values(
+        "active_mean_mA",
+        ascending=True,
+    ).iloc[0]
+
+    min_delta_row = minimum_df.sort_values(
+        "delta_mean_mA",
+        ascending=True,
+    ).iloc[0]
+
+    absolute_operating_range_mA = (
+        max_active_row["active_mean_mA"]
+        - min_active_row["active_mean_mA"]
+    )
+
+    absolute_operating_range_corrected_mA = (
+        max_active_row["active_mean_corrected_mA"]
+        - min_active_row["active_mean_corrected_mA"]
+    )
+
+    workload_induced_delta_range_mA = (
+        max_delta_row["delta_mean_mA"]
+        - min_delta_row["delta_mean_mA"]
+    )
+
+    return pd.DataFrame([
+        {
+            "minimum_by_active_workload": min_active_row["workload"],
+            "minimum_active_mean_mA": min_active_row["active_mean_mA"],
+            "minimum_active_mean_corrected_mA": (
+                min_active_row["active_mean_corrected_mA"]
+            ),
+            "minimum_delta_workload": min_delta_row["workload"],
+            "minimum_delta_mean_mA": min_delta_row["delta_mean_mA"],
+
+            "maximum_by_active_workload": max_active_row["workload"],
+            "maximum_active_mean_mA": max_active_row["active_mean_mA"],
+            "maximum_active_mean_corrected_mA": (
+                max_active_row["active_mean_corrected_mA"]
+            ),
+            "maximum_delta_workload": max_delta_row["workload"],
+            "maximum_delta_mean_mA": max_delta_row["delta_mean_mA"],
+
+            "absolute_operating_range_mA": absolute_operating_range_mA,
+            "absolute_operating_range_corrected_mA": (
+                absolute_operating_range_corrected_mA
+            ),
+            "workload_induced_delta_range_mA": (
+                workload_induced_delta_range_mA
+            ),
+
+            "ch340c_typ_current_mA": CH340C_TYP_CURRENT_MA,
+            "note": (
+                "CH340C correction changes absolute current estimates, "
+                "but not delta or range width when the same offset is "
+                "subtracted from both minimum and maximum."
+            ),
+        }
+    ])
 
 
 # ============================================================
@@ -529,9 +717,9 @@ def plot_category_comparison(workload_df, category):
         ha="right",
     )
 
-    plt.ylabel("Active mean current [mA]")
+    plt.ylabel("Active/state mean current [mA]")
     plt.title(
-        f"Core-only {category}: active mean current"
+        f"Core-only {category}: active/state mean current"
     )
     plt.grid(axis="y")
     plt.tight_layout()
@@ -570,9 +758,9 @@ def plot_category_comparison(workload_df, category):
         ha="right",
     )
 
-    plt.ylabel("Active − idle current [mA]")
+    plt.ylabel("Active/state − idle current [mA]")
     plt.title(
-        f"Core-only {category}: workload current increase"
+        f"Core-only {category}: workload-induced current increase"
     )
     plt.grid(axis="y")
     plt.tight_layout()
@@ -581,6 +769,52 @@ def plot_category_comparison(workload_df, category):
         OUT_ROOT
         / f"core_only_{category}_delta_comparison.png"
     )
+
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+    print(f"Saved: {out_path}")
+
+
+def plot_all_delta_comparison(workload_df):
+    """Plot all workloads together by delta current."""
+    if workload_df.empty:
+        return
+
+    plot_df = workload_df.sort_values(
+        "delta_mean_mA",
+        ascending=False,
+    ).copy()
+
+    labels = [
+        f"{row.workload}\n({row.category})"
+        for row in plot_df.itertuples()
+    ]
+
+    x = np.arange(len(labels))
+
+    plt.figure(figsize=(12, 6))
+
+    plt.bar(
+        x,
+        plot_df["delta_mean_mA"],
+        yerr=plot_df["delta_between_run_std_mA"].fillna(0),
+        capsize=4,
+    )
+
+    plt.xticks(
+        x,
+        labels,
+        rotation=25,
+        ha="right",
+    )
+
+    plt.ylabel("Active/state − idle current [mA]")
+    plt.title("Core-only workloads: ΔI comparison")
+    plt.grid(axis="y")
+    plt.tight_layout()
+
+    out_path = OUT_ROOT / "core_only_all_delta_comparison.png"
 
     plt.savefig(out_path, dpi=200)
     plt.close()
@@ -638,12 +872,18 @@ def main():
 
     workload_df = aggregate_workloads(run_df)
 
+    range_df = build_operating_range_summary(workload_df)
+
     run_summary_path = (
         OUT_ROOT / "core_only_run_summary.csv"
     )
 
     workload_summary_path = (
         OUT_ROOT / "core_only_workload_summary.csv"
+    )
+
+    range_summary_path = (
+        OUT_ROOT / "core_only_operating_range_summary.csv"
     )
 
     run_df.to_csv(
@@ -656,10 +896,19 @@ def main():
         index=False,
     )
 
+    if not range_df.empty:
+        range_df.to_csv(
+            range_summary_path,
+            index=False,
+        )
+
     print()
     print("Saved:")
     print(run_summary_path)
     print(workload_summary_path)
+
+    if not range_df.empty:
+        print(range_summary_path)
 
     plot_category_comparison(
         workload_df,
@@ -671,6 +920,8 @@ def main():
         "minimum",
     )
 
+    plot_all_delta_comparison(workload_df)
+
     maximum_df = workload_df[
         workload_df["category"] == "maximum"
     ].sort_values(
@@ -678,10 +929,24 @@ def main():
         ascending=False,
     )
 
+    maximum_delta_df = workload_df[
+        workload_df["category"] == "maximum"
+    ].sort_values(
+        "delta_mean_mA",
+        ascending=False,
+    )
+
     minimum_df = workload_df[
         workload_df["category"] == "minimum"
     ].sort_values(
         "active_mean_mA",
+        ascending=True,
+    )
+
+    minimum_delta_df = workload_df[
+        workload_df["category"] == "minimum"
+    ].sort_values(
+        "delta_mean_mA",
         ascending=True,
     )
 
@@ -696,48 +961,92 @@ def main():
                 "idle_mean_mA",
                 "active_mean_mA",
                 "delta_mean_mA",
+                "idle_mean_corrected_mA",
+                "active_mean_corrected_mA",
                 "active_rank",
                 "delta_rank",
+                "active_low_current_rank",
+                "delta_low_current_rank",
             ]
         ].to_string(index=False)
     )
 
     if not maximum_df.empty:
-        max_row = maximum_df.iloc[0]
+        max_active_row = maximum_df.iloc[0]
 
         print()
-        print("Detected Core-only Max candidate:")
-        print(f"Workload: {max_row['workload']}")
+        print("Detected Core-only Max candidate by active mean:")
+        print(f"Workload: {max_active_row['workload']}")
         print(
             f"Active mean: "
-            f"{max_row['active_mean_mA']:.3f} mA"
+            f"{max_active_row['active_mean_mA']:.3f} mA"
+        )
+        print(
+            f"Corrected active mean: "
+            f"{max_active_row['active_mean_corrected_mA']:.3f} mA"
         )
         print(
             f"Delta: "
-            f"{max_row['delta_mean_mA']:.3f} mA"
+            f"{max_active_row['delta_mean_mA']:.3f} mA"
+        )
+
+    if not maximum_delta_df.empty:
+        max_delta_row = maximum_delta_df.iloc[0]
+
+        print()
+        print("Detected Core-only Max candidate by ΔI:")
+        print(f"Workload: {max_delta_row['workload']}")
+        print(
+            f"Delta: "
+            f"{max_delta_row['delta_mean_mA']:.3f} mA"
         )
 
     if not minimum_df.empty:
-        min_row = minimum_df.iloc[0]
+        min_active_row = minimum_df.iloc[0]
 
         print()
-        print("Detected Core-only Min candidate:")
-        print(f"Workload/state: {min_row['workload']}")
+        print("Detected Core-only Min candidate by active/state mean:")
+        print(f"Workload/state: {min_active_row['workload']}")
         print(
             f"Active/state mean: "
-            f"{min_row['active_mean_mA']:.3f} mA"
+            f"{min_active_row['active_mean_mA']:.3f} mA"
+        )
+        print(
+            f"Corrected active/state mean: "
+            f"{min_active_row['active_mean_corrected_mA']:.3f} mA"
+        )
+        print(
+            f"Delta: "
+            f"{min_active_row['delta_mean_mA']:.3f} mA"
         )
 
-    if not maximum_df.empty and not minimum_df.empty:
-        core_range_mA = (
-            maximum_df.iloc[0]["active_mean_mA"]
-            - minimum_df.iloc[0]["active_mean_mA"]
-        )
+    if not minimum_delta_df.empty:
+        min_delta_row = minimum_delta_df.iloc[0]
 
         print()
+        print("Detected Core-only Min candidate by ΔI:")
+        print(f"Workload/state: {min_delta_row['workload']}")
         print(
-            f"Observed Core-only operating range: "
-            f"{core_range_mA:.3f} mA"
+            f"Delta: "
+            f"{min_delta_row['delta_mean_mA']:.3f} mA"
+        )
+
+    if not range_df.empty:
+        row = range_df.iloc[0]
+
+        print()
+        print("Observed Core-only operating range:")
+        print(
+            "Absolute active/state-current range: "
+            f"{row['absolute_operating_range_mA']:.3f} mA"
+        )
+        print(
+            "CH340C-corrected absolute range: "
+            f"{row['absolute_operating_range_corrected_mA']:.3f} mA"
+        )
+        print(
+            "Workload-induced ΔI range: "
+            f"{row['workload_induced_delta_range_mA']:.3f} mA"
         )
 
 
