@@ -14,6 +14,13 @@ import matplotlib.pyplot as plt
 PROCESSED_ROOT = Path("data/processed/v3_ppk/peripheral/uart_tx_only")
 RESULTS_ROOT = Path("results/v3_ppk/peripheral/uart_tx_only")
 
+D1_IDLE_BASELINE_DIR = Path("data/raw/v3_ppk/idle_baseline")
+
+D3_UART_ENABLED_SUMMARY = Path(
+    "results/v3_ppk/peripheral/uart_tx_only/uart_enabled/"
+    "uart_enabled_idle_mean_20_30s.csv"
+)
+
 
 # ============================================================
 # UART settings
@@ -25,6 +32,9 @@ UART_BITS_PER_BYTE_8N1 = 10
 INITIAL_IDLE_END_S = 10.0
 UART_ACTIVE_END_S = 30.0
 FINAL_END_S = 40.0
+
+DECOMPOSITION_WINDOW_START_S = 20.0
+DECOMPOSITION_WINDOW_END_S = 30.0
 
 
 # ============================================================
@@ -40,7 +50,6 @@ USE_IDLE_OFFSET_CORRECTION = True
 # Keep this False unless you really need huge prediction CSV files.
 SAVE_PREDICTION_CSV = False
 
-# Plot downsampling
 MAX_PLOT_POINTS = 50000
 
 
@@ -60,13 +69,21 @@ EVAL_WINDOWS = {
 # Helpers
 # ============================================================
 
+def natural_key(path: Path):
+    numbers = re.findall(r"\d+", path.name)
+    return int(numbers[-1]) if numbers else 0
+
+
+def parse_run_index(text: str) -> int:
+    m = re.search(r"run(\d+)", text)
+
+    if not m:
+        raise ValueError(f"Could not parse run index from: {text}")
+
+    return int(m.group(1))
+
+
 def parse_condition(condition_name: str):
-    """
-    Expected condition name:
-        uart_64B_100ms
-        uart_256B_100ms
-        uart_512B_100ms
-    """
     m = re.match(r"uart_(\d+)B_(\d+)ms", condition_name)
 
     if not m:
@@ -78,13 +95,93 @@ def parse_condition(condition_name: str):
     return tx_bytes, period_ms
 
 
-def compute_tx_duration_s(tx_bytes: int) -> float:
-    """
-    UART 8N1:
-        1 byte = 10 transmitted bits
+def load_ppk2_raw_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
 
-    tx_duration_s = tx_bytes * 10 / baud_rate
-    """
+    if "Timestamp(ms)" not in df.columns or "Current(uA)" not in df.columns:
+        raise ValueError(f"Unexpected raw CSV columns in {path}: {df.columns.tolist()}")
+
+    df["time_s"] = df["Timestamp(ms)"] / 1000.0
+    df["current_mA"] = df["Current(uA)"] / 1000.0
+
+    return df
+
+
+def mean_current_window_from_df(df: pd.DataFrame, t0: float, t1: float) -> float:
+    mask = (df["time_s"] >= t0) & (df["time_s"] < t1)
+
+    if not mask.any():
+        raise ValueError(f"No samples found in window {t0}-{t1}s")
+
+    return df.loc[mask, "current_mA"].mean()
+
+
+def mean_current_window_from_arrays(
+    time_s: np.ndarray,
+    current_mA: np.ndarray,
+    t0: float,
+    t1: float,
+) -> float:
+    mask = (time_s >= t0) & (time_s < t1)
+
+    if not np.any(mask):
+        raise ValueError(f"No samples found in window {t0}-{t1}s")
+
+    return float(np.mean(current_mA[mask]))
+
+
+def load_d1_idle_baseline_means() -> dict:
+    files = sorted(
+        D1_IDLE_BASELINE_DIR.glob("ppk_idle_baseline_run*.csv"),
+        key=natural_key
+    )
+
+    if not files:
+        raise FileNotFoundError(f"No D1 idle baseline files found in {D1_IDLE_BASELINE_DIR}")
+
+    result = {}
+
+    for path in files:
+        run_index = parse_run_index(path.name)
+        df = load_ppk2_raw_csv(path)
+        mean_mA = mean_current_window_from_df(
+            df,
+            DECOMPOSITION_WINDOW_START_S,
+            DECOMPOSITION_WINDOW_END_S
+        )
+        result[run_index] = mean_mA
+
+    return result
+
+
+def load_d3_uart_enabled_means() -> dict:
+    if not D3_UART_ENABLED_SUMMARY.exists():
+        raise FileNotFoundError(f"D3 summary not found: {D3_UART_ENABLED_SUMMARY}")
+
+    df = pd.read_csv(D3_UART_ENABLED_SUMMARY)
+
+    if "mean_current_mA" not in df.columns:
+        raise ValueError(
+            f"D3 summary does not contain mean_current_mA: {D3_UART_ENABLED_SUMMARY}"
+        )
+
+    result = {}
+
+    if "run_index" in df.columns:
+        for _, row in df.iterrows():
+            result[int(row["run_index"])] = float(row["mean_current_mA"])
+    elif "run" in df.columns:
+        for _, row in df.iterrows():
+            run_index = parse_run_index(str(row["run"]))
+            result[run_index] = float(row["mean_current_mA"])
+    else:
+        for idx, row in df.iterrows():
+            result[idx + 1] = float(row["mean_current_mA"])
+
+    return result
+
+
+def compute_tx_duration_s(tx_bytes: int) -> float:
     return tx_bytes * UART_BITS_PER_BYTE_8N1 / UART_BAUD_RATE
 
 
@@ -95,15 +192,6 @@ def compute_uart_occupancy(tx_bytes: int, period_ms: int) -> float:
 
 
 def compute_pulse_input(time_s: np.ndarray, tx_duration_s: float, period_s: float) -> np.ndarray:
-    """
-    100 ms pulse approximation input:
-
-        0-10 s      : u = 0
-        10-30 s     : u = 1 during estimated UART TX duration
-                       u = 0 for the rest of each period
-        30-40 s     : u = 0
-    """
-
     u = np.zeros(len(time_s), dtype=float)
 
     active_mask = (time_s >= INITIAL_IDLE_END_S) & (time_s < UART_ACTIVE_END_S)
@@ -128,14 +216,6 @@ def fill_ode_segment(
     state_start_mA: float,
     target_mA: float,
 ) -> float:
-    """
-    Fill prediction for [start_s, end_s) using exact first-order ODE update:
-
-        I(t) = I_target + (I_start - I_target) * exp(-(t - start) / tau)
-
-    Returns the state at end_s.
-    """
-
     i0 = np.searchsorted(time_s, start_s, side="left")
     i1 = np.searchsorted(time_s, end_s, side="left")
 
@@ -158,21 +238,6 @@ def simulate_pulse_ode_fast(
     period_s: float,
     i0_mA: float,
 ) -> np.ndarray:
-    """
-    Fast prediction for UART 100 ms pulse approximation input.
-
-    Input definition:
-        0-10 s      : u = 0
-        10-30 s     : repeated UART TX pulse
-        30-40 s     : u = 0
-
-    During pulse:
-        u = 1 -> target = I_active
-
-    Outside pulse:
-        u = 0 -> target = I_idle
-    """
-
     if MODEL_TAU_S <= 0:
         raise ValueError("MODEL_TAU_S must be positive.")
 
@@ -181,7 +246,6 @@ def simulate_pulse_ode_fast(
     i_idle = MODEL_I_IDLE_MA
     i_active = MODEL_I_ACTIVE_MA
 
-    # Segment 1: initial idle, 0-10 s
     state = fill_ode_segment(
         pred=pred,
         time_s=time_s,
@@ -191,7 +255,6 @@ def simulate_pulse_ode_fast(
         target_mA=i_idle,
     )
 
-    # Segment 2: UART active interval, 10-30 s
     n_periods = int(round((UART_ACTIVE_END_S - INITIAL_IDLE_END_S) / period_s))
 
     for n in range(n_periods):
@@ -200,7 +263,6 @@ def simulate_pulse_ode_fast(
         pulse_end = min(period_start + tx_duration_s, UART_ACTIVE_END_S)
         period_end = min(period_start + period_s, UART_ACTIVE_END_S)
 
-        # UART TX pulse: u = 1
         if pulse_end > pulse_start:
             state = fill_ode_segment(
                 pred=pred,
@@ -211,7 +273,6 @@ def simulate_pulse_ode_fast(
                 target_mA=i_active,
             )
 
-        # Rest of period: u = 0
         if period_end > pulse_end:
             state = fill_ode_segment(
                 pred=pred,
@@ -222,8 +283,7 @@ def simulate_pulse_ode_fast(
                 target_mA=i_idle,
             )
 
-    # Segment 3: final idle, 30-40 s
-    state = fill_ode_segment(
+    fill_ode_segment(
         pred=pred,
         time_s=time_s,
         start_s=UART_ACTIVE_END_S,
@@ -289,11 +349,6 @@ def make_plot(
     out_plot: Path,
     title: str,
 ):
-    """
-    Save measured vs predicted current plot.
-    Downsample only for plotting speed.
-    """
-
     n = len(time_s)
 
     if n > MAX_PLOT_POINTS:
@@ -377,9 +432,14 @@ def maybe_save_prediction_csv(
     return str(out_csv)
 
 
-def process_one_file(processed_file: Path) -> dict:
+def process_one_file(
+    processed_file: Path,
+    d1_means_by_run: dict,
+    d3_means_by_run: dict,
+) -> dict:
     condition = processed_file.parent.name
     tx_bytes, period_ms = parse_condition(condition)
+    run_index = parse_run_index(processed_file.name)
 
     period_s = period_ms / 1000.0
     tx_duration_s = compute_tx_duration_s(tx_bytes)
@@ -387,6 +447,7 @@ def process_one_file(processed_file: Path) -> dict:
 
     print(f"\nProcessing: {processed_file}")
     print(f"Condition: {condition}")
+    print(f"run_index = {run_index}")
     print(f"tx_bytes = {tx_bytes}")
     print(f"period_ms = {period_ms}")
     print(f"tx_duration_s = {tx_duration_s:.9f}")
@@ -404,7 +465,6 @@ def process_one_file(processed_file: Path) -> dict:
     time_s = time_s[valid]
     measured = measured[valid]
 
-    # Initial condition from first measured sample
     i0_mA = measured[0]
 
     predicted = simulate_pulse_ode_fast(
@@ -424,6 +484,26 @@ def process_one_file(processed_file: Path) -> dict:
         predicted = predicted + offset
     else:
         offset = 0.0
+
+    d4_active_mean_mA = mean_current_window_from_arrays(
+        time_s,
+        measured,
+        DECOMPOSITION_WINDOW_START_S,
+        DECOMPOSITION_WINDOW_END_S
+    )
+
+    if run_index not in d1_means_by_run:
+        raise ValueError(f"D1 idle baseline missing for run {run_index}")
+
+    if run_index not in d3_means_by_run:
+        raise ValueError(f"D3 UART enabled idle missing for run {run_index}")
+
+    d1_idle_mA = d1_means_by_run[run_index]
+    d3_enabled_mA = d3_means_by_run[run_index]
+
+    uart_enable_overhead_mA = d3_enabled_mA - d1_idle_mA
+    tx_activity_overhead_mA = d4_active_mean_mA - d3_enabled_mA
+    total_uart_difference_mA = d4_active_mean_mA - d1_idle_mA
 
     out_dir = RESULTS_ROOT / condition / "pulse_input"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -453,6 +533,7 @@ def process_one_file(processed_file: Path) -> dict:
 
     summary = {
         "condition": condition,
+        "run_index": run_index,
         "source_file": str(processed_file),
         "tx_bytes": tx_bytes,
         "period_ms": period_ms,
@@ -466,11 +547,28 @@ def process_one_file(processed_file: Path) -> dict:
         "model_tau_s": MODEL_TAU_S,
         "use_idle_offset_correction": USE_IDLE_OFFSET_CORRECTION,
         "prediction_offset_mA": offset,
+
+        "decomposition_window_start_s": DECOMPOSITION_WINDOW_START_S,
+        "decomposition_window_end_s": DECOMPOSITION_WINDOW_END_S,
+        "D1_idle_baseline_mA": d1_idle_mA,
+        "D3_uart_enabled_idle_mA": d3_enabled_mA,
+        "D4_uart_tx_active_mA": d4_active_mean_mA,
+        "D3_minus_D1_uart_enable_overhead_mA": uart_enable_overhead_mA,
+        "D4_minus_D3_tx_activity_overhead_mA": tx_activity_overhead_mA,
+        "D4_minus_D1_total_uart_difference_mA": total_uart_difference_mA,
+
         "output_prediction_csv": output_csv_str,
         "output_plot": str(out_plot),
     }
 
     summary.update(metrics)
+
+    print(f"D1 idle baseline = {d1_idle_mA:.6f} mA")
+    print(f"D3 UART enabled idle = {d3_enabled_mA:.6f} mA")
+    print(f"D4 UART TX active = {d4_active_mean_mA:.6f} mA")
+    print(f"D3-D1 enable overhead = {uart_enable_overhead_mA:.6f} mA")
+    print(f"D4-D3 TX activity overhead = {tx_activity_overhead_mA:.6f} mA")
+    print(f"D4-D1 total UART difference = {total_uart_difference_mA:.6f} mA")
 
     print(f"Saved plot: {out_plot}")
 
@@ -478,6 +576,31 @@ def process_one_file(processed_file: Path) -> dict:
         print(f"Saved prediction CSV: {out_csv}")
 
     return summary
+
+
+def save_condition_decomposition_summary(summary_df: pd.DataFrame):
+    decomposition_summary = (
+        summary_df
+        .groupby("condition")
+        .agg(
+            runs=("run_index", "count"),
+            D1_mean_mA=("D1_idle_baseline_mA", "mean"),
+            D3_mean_mA=("D3_uart_enabled_idle_mA", "mean"),
+            D4_mean_mA=("D4_uart_tx_active_mA", "mean"),
+            uart_enable_overhead_mean_mA=("D3_minus_D1_uart_enable_overhead_mA", "mean"),
+            uart_enable_overhead_std_mA=("D3_minus_D1_uart_enable_overhead_mA", "std"),
+            tx_activity_overhead_mean_mA=("D4_minus_D3_tx_activity_overhead_mA", "mean"),
+            tx_activity_overhead_std_mA=("D4_minus_D3_tx_activity_overhead_mA", "std"),
+            total_uart_difference_mean_mA=("D4_minus_D1_total_uart_difference_mA", "mean"),
+            total_uart_difference_std_mA=("D4_minus_D1_total_uart_difference_mA", "std"),
+        )
+        .reset_index()
+    )
+
+    out = RESULTS_ROOT / "summary_uart_pulse_baseline_decomposition.csv"
+    decomposition_summary.to_csv(out, index=False)
+
+    print(f"Saved decomposition summary: {out}")
 
 
 def main():
@@ -488,10 +611,20 @@ def main():
 
     print(f"Found {len(processed_files)} processed CSV files.")
 
+    d1_means_by_run = load_d1_idle_baseline_means()
+    d3_means_by_run = load_d3_uart_enabled_means()
+
+    print(f"Loaded D1 idle baseline runs: {sorted(d1_means_by_run.keys())}")
+    print(f"Loaded D3 UART enabled runs: {sorted(d3_means_by_run.keys())}")
+
     summaries = []
 
     for processed_file in processed_files:
-        summary = process_one_file(processed_file)
+        summary = process_one_file(
+            processed_file,
+            d1_means_by_run,
+            d3_means_by_run,
+        )
         summaries.append(summary)
 
     summary_df = pd.DataFrame(summaries)
@@ -499,6 +632,8 @@ def main():
     summary_out = RESULTS_ROOT / "summary_uart_pulse_input_validation.csv"
     summary_out.parent.mkdir(parents=True, exist_ok=True)
     summary_df.to_csv(summary_out, index=False)
+
+    save_condition_decomposition_summary(summary_df)
 
     print(f"\nSaved summary: {summary_out}")
     print("Done.")

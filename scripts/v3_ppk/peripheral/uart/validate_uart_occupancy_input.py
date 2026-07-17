@@ -14,6 +14,13 @@ import matplotlib.pyplot as plt
 PROCESSED_ROOT = Path("data/processed/v3_ppk/peripheral/uart_tx_only")
 RESULTS_ROOT = Path("results/v3_ppk/peripheral/uart_tx_only")
 
+D1_IDLE_BASELINE_DIR = Path("data/raw/v3_ppk/idle_baseline")
+
+D3_UART_ENABLED_SUMMARY = Path(
+    "results/v3_ppk/peripheral/uart_tx_only/uart_enabled/"
+    "uart_enabled_idle_mean_20_30s.csv"
+)
+
 
 # ============================================================
 # UART settings
@@ -27,25 +34,20 @@ INITIAL_IDLE_END_S = 10.0
 UART_ACTIVE_END_S = 30.0
 FINAL_END_S = 40.0
 
+DECOMPOSITION_WINDOW_START_S = 20.0
+DECOMPOSITION_WINDOW_END_S = 30.0
+
 
 # ============================================================
 # ODE model parameters
-# IMPORTANT:
-# Replace these values with the parameters from your CPU100-trained ODE model.
 # ============================================================
 
 MODEL_I_IDLE_MA = 47.2668
 MODEL_I_ACTIVE_MA = 67.4556
 MODEL_TAU_S = 0.0004895
 
-# If True, prediction is vertically shifted so that the initial-idle mean
-# matches the measured initial-idle mean.
-# Use the same policy as your previous CPU validation scripts.
 USE_IDLE_OFFSET_CORRECTION = True
-SAVE_PREDICTION_CSV = False
 
-# Evaluation windows.
-# These avoid phase boundaries where timing/transition uncertainty is larger.
 EVAL_WINDOWS = {
     "initial_idle_center": (2.0, 9.0),
     "uart_active_center": (12.0, 29.0),
@@ -58,13 +60,21 @@ EVAL_WINDOWS = {
 # Helpers
 # ============================================================
 
+def natural_key(path: Path):
+    numbers = re.findall(r"\d+", path.name)
+    return int(numbers[-1]) if numbers else 0
+
+
+def parse_run_index(text: str) -> int:
+    m = re.search(r"run(\d+)", text)
+
+    if not m:
+        raise ValueError(f"Could not parse run index from: {text}")
+
+    return int(m.group(1))
+
+
 def parse_condition(condition_name: str):
-    """
-    Expected condition name:
-        uart_64B_100ms
-        uart_256B_100ms
-        uart_512B_100ms
-    """
     m = re.match(r"uart_(\d+)B_(\d+)ms", condition_name)
 
     if not m:
@@ -76,14 +86,79 @@ def parse_condition(condition_name: str):
     return tx_bytes, period_ms
 
 
+def load_ppk2_raw_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+
+    if "Timestamp(ms)" not in df.columns or "Current(uA)" not in df.columns:
+        raise ValueError(f"Unexpected raw CSV columns in {path}: {df.columns.tolist()}")
+
+    df["time_s"] = df["Timestamp(ms)"] / 1000.0
+    df["current_mA"] = df["Current(uA)"] / 1000.0
+
+    return df
+
+
+def mean_current_window(df: pd.DataFrame, t0: float, t1: float) -> float:
+    mask = (df["time_s"] >= t0) & (df["time_s"] < t1)
+
+    if not mask.any():
+        raise ValueError(f"No samples found in window {t0}-{t1}s")
+
+    return df.loc[mask, "current_mA"].mean()
+
+
+def load_d1_idle_baseline_means() -> dict:
+    files = sorted(
+        D1_IDLE_BASELINE_DIR.glob("ppk_idle_baseline_run*.csv"),
+        key=natural_key
+    )
+
+    if not files:
+        raise FileNotFoundError(f"No D1 idle baseline files found in {D1_IDLE_BASELINE_DIR}")
+
+    result = {}
+
+    for path in files:
+        run_index = parse_run_index(path.name)
+        df = load_ppk2_raw_csv(path)
+        mean_mA = mean_current_window(
+            df,
+            DECOMPOSITION_WINDOW_START_S,
+            DECOMPOSITION_WINDOW_END_S
+        )
+        result[run_index] = mean_mA
+
+    return result
+
+
+def load_d3_uart_enabled_means() -> dict:
+    if not D3_UART_ENABLED_SUMMARY.exists():
+        raise FileNotFoundError(f"D3 summary not found: {D3_UART_ENABLED_SUMMARY}")
+
+    df = pd.read_csv(D3_UART_ENABLED_SUMMARY)
+
+    if "mean_current_mA" not in df.columns:
+        raise ValueError(
+            f"D3 summary does not contain mean_current_mA: {D3_UART_ENABLED_SUMMARY}"
+        )
+
+    result = {}
+
+    if "run_index" in df.columns:
+        for _, row in df.iterrows():
+            result[int(row["run_index"])] = float(row["mean_current_mA"])
+    elif "run" in df.columns:
+        for _, row in df.iterrows():
+            run_index = parse_run_index(str(row["run"]))
+            result[run_index] = float(row["mean_current_mA"])
+    else:
+        for idx, row in df.iterrows():
+            result[idx + 1] = float(row["mean_current_mA"])
+
+    return result
+
+
 def compute_uart_occupancy(tx_bytes: int, period_ms: int) -> float:
-    """
-    Normalized UART TX occupancy.
-
-    bytes_per_second = tx_bytes * 1000 / period_ms
-    max_bytes_per_second = baud_rate / 10 for 8N1 UART framing
-    """
-
     bytes_per_second = tx_bytes * 1000.0 / period_ms
     max_bytes_per_second = UART_BAUD_RATE / UART_BITS_PER_BYTE_8N1
 
@@ -93,14 +168,6 @@ def compute_uart_occupancy(tx_bytes: int, period_ms: int) -> float:
 
 
 def add_occupancy_input(df: pd.DataFrame, occupancy: float) -> pd.DataFrame:
-    """
-    Phase-level occupancy input:
-
-        0-10 s   : u = 0
-        10-30 s  : u = occupancy
-        30-40 s  : u = 0
-    """
-
     t = df["time_s"].to_numpy()
 
     u = np.zeros(len(df), dtype=float)
@@ -112,48 +179,26 @@ def add_occupancy_input(df: pd.DataFrame, occupancy: float) -> pd.DataFrame:
     return df
 
 
-def simulate_occupancy_ode_vectorized(time_s: np.ndarray, occupancy: float, i0_mA: float) -> np.ndarray:
-    """
-    Fast vectorized prediction for phase-level UART occupancy input.
-
-    Input:
-        0-10 s   : u = 0
-        10-30 s  : u = occupancy
-        30-40 s  : u = 0
-    """
-
+def simulate_first_order_ode(time_s: np.ndarray, u: np.ndarray, i0_mA: float) -> np.ndarray:
     if MODEL_TAU_S <= 0:
         raise ValueError("MODEL_TAU_S must be set to a positive value.")
 
-    i_idle_target = MODEL_I_IDLE_MA
-    i_uart_target = MODEL_I_IDLE_MA + occupancy * (MODEL_I_ACTIVE_MA - MODEL_I_IDLE_MA)
-
     pred = np.zeros(len(time_s), dtype=float)
+    pred[0] = i0_mA
 
-    # Segment 1: initial idle, 0-10s
-    mask1 = time_s < INITIAL_IDLE_END_S
-    t1 = time_s[mask1]
-    pred[mask1] = i_idle_target + (i0_mA - i_idle_target) * np.exp(-(t1 - t1[0]) / MODEL_TAU_S)
+    for k in range(1, len(time_s)):
+        dt = time_s[k] - time_s[k - 1]
 
-    # State at 10s
-    i_at_10 = i_idle_target + (i0_mA - i_idle_target) * np.exp(-(INITIAL_IDLE_END_S - t1[0]) / MODEL_TAU_S)
+        if dt <= 0:
+            pred[k] = pred[k - 1]
+            continue
 
-    # Segment 2: UART active, 10-30s
-    mask2 = (time_s >= INITIAL_IDLE_END_S) & (time_s < UART_ACTIVE_END_S)
-    t2 = time_s[mask2]
-    pred[mask2] = i_uart_target + (i_at_10 - i_uart_target) * np.exp(-(t2 - INITIAL_IDLE_END_S) / MODEL_TAU_S)
+        i_target = MODEL_I_IDLE_MA + u[k - 1] * (MODEL_I_ACTIVE_MA - MODEL_I_IDLE_MA)
 
-    # State at 30s
-    i_at_30 = i_uart_target + (i_at_10 - i_uart_target) * np.exp(-(UART_ACTIVE_END_S - INITIAL_IDLE_END_S) / MODEL_TAU_S)
-
-    # Segment 3: final idle, 30-40s
-    mask3 = time_s >= UART_ACTIVE_END_S
-    t3 = time_s[mask3]
-    pred[mask3] = i_idle_target + (i_at_30 - i_idle_target) * np.exp(-(t3 - UART_ACTIVE_END_S) / MODEL_TAU_S)
+        alpha = math.exp(-dt / MODEL_TAU_S)
+        pred[k] = i_target + (pred[k - 1] - i_target) * alpha
 
     return pred
-
-
 
 
 def compute_metrics(df: pd.DataFrame) -> dict:
@@ -175,7 +220,6 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         metrics[f"{name}_mean_predicted_mA"] = np.mean(predicted)
         metrics[f"{name}_mean_error_mA"] = np.mean(err)
 
-    # Useful current-level comparison
     initial_mask = (df["time_s"] >= 2.0) & (df["time_s"] < 9.0)
     active_mask = (df["time_s"] >= 12.0) & (df["time_s"] < 29.0)
     final_mask = (df["time_s"] >= 32.0) & (df["time_s"] < 39.0)
@@ -194,11 +238,6 @@ def compute_metrics(df: pd.DataFrame) -> dict:
 
 
 def make_plot(df: pd.DataFrame, out_plot: Path, title: str):
-    """
-    Save measured vs predicted current plot.
-    Downsample only for plotting speed.
-    """
-
     plot_df = df
 
     max_plot_points = 50000
@@ -250,14 +289,20 @@ def make_plot(df: pd.DataFrame, out_plot: Path, title: str):
     plt.close(fig)
 
 
-def process_one_file(processed_file: Path) -> dict:
+def process_one_file(
+    processed_file: Path,
+    d1_means_by_run: dict,
+    d3_means_by_run: dict
+) -> dict:
     condition = processed_file.parent.name
     tx_bytes, period_ms = parse_condition(condition)
+    run_index = parse_run_index(processed_file.name)
 
     occupancy = compute_uart_occupancy(tx_bytes, period_ms)
 
     print(f"\nProcessing: {processed_file}")
     print(f"Condition: {condition}")
+    print(f"run_index = {run_index}")
     print(f"tx_bytes = {tx_bytes}")
     print(f"period_ms = {period_ms}")
     print(f"UART occupancy = {occupancy:.6f}")
@@ -276,10 +321,9 @@ def process_one_file(processed_file: Path) -> dict:
     measured = df["current_mA"].to_numpy()
     u = df["u_uart_occupancy"].to_numpy()
 
-    # Initial condition from first measured sample
     i0_mA = measured[0]
 
-    pred = simulate_occupancy_ode_vectorized(time_s, occupancy, i0_mA)
+    pred = simulate_first_order_ode(time_s, u, i0_mA)
 
     df["current_pred_mA"] = pred
 
@@ -297,17 +341,30 @@ def process_one_file(processed_file: Path) -> dict:
 
     df["error_mA"] = df["current_pred_mA"] - df["current_mA"]
 
+    d4_active_mean_mA = mean_current_window(
+        df,
+        DECOMPOSITION_WINDOW_START_S,
+        DECOMPOSITION_WINDOW_END_S
+    )
+
+    if run_index not in d1_means_by_run:
+        raise ValueError(f"D1 idle baseline missing for run {run_index}")
+
+    if run_index not in d3_means_by_run:
+        raise ValueError(f"D3 UART enabled idle missing for run {run_index}")
+
+    d1_idle_mA = d1_means_by_run[run_index]
+    d3_enabled_mA = d3_means_by_run[run_index]
+
+    uart_enable_overhead_mA = d3_enabled_mA - d1_idle_mA
+    tx_activity_overhead_mA = d4_active_mean_mA - d3_enabled_mA
+    total_uart_difference_mA = d4_active_mean_mA - d1_idle_mA
+
     out_dir = RESULTS_ROOT / condition / "occupancy_input"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     out_csv = out_dir / f"prediction_occupancy_{processed_file.stem}.csv"
-
-    if SAVE_PREDICTION_CSV:
-        df.to_csv(out_csv, index=False)
-        output_csv_str = str(out_csv)
-        print(f"Saved prediction CSV: {out_csv}")
-    else:
-        output_csv_str = "not_saved"
+    df.to_csv(out_csv, index=False)
 
     out_plot = out_dir / f"plot_occupancy_{processed_file.stem}.png"
     make_plot(
@@ -320,6 +377,7 @@ def process_one_file(processed_file: Path) -> dict:
 
     summary = {
         "condition": condition,
+        "run_index": run_index,
         "source_file": str(processed_file),
         "tx_bytes": tx_bytes,
         "period_ms": period_ms,
@@ -330,15 +388,67 @@ def process_one_file(processed_file: Path) -> dict:
         "model_i_active_mA": MODEL_I_ACTIVE_MA,
         "model_tau_s": MODEL_TAU_S,
         "use_idle_offset_correction": USE_IDLE_OFFSET_CORRECTION,
-        "output_prediction_csv": output_csv_str,
+
+        "decomposition_window_start_s": DECOMPOSITION_WINDOW_START_S,
+        "decomposition_window_end_s": DECOMPOSITION_WINDOW_END_S,
+        "D1_idle_baseline_mA": d1_idle_mA,
+        "D3_uart_enabled_idle_mA": d3_enabled_mA,
+        "D4_uart_tx_active_mA": d4_active_mean_mA,
+        "D3_minus_D1_uart_enable_overhead_mA": uart_enable_overhead_mA,
+        "D4_minus_D3_tx_activity_overhead_mA": tx_activity_overhead_mA,
+        "D4_minus_D1_total_uart_difference_mA": total_uart_difference_mA,
+
+        "output_prediction_csv": str(out_csv),
         "output_plot": str(out_plot),
     }
 
     summary.update(metrics)
 
+    print(f"D1 idle baseline = {d1_idle_mA:.6f} mA")
+    print(f"D3 UART enabled idle = {d3_enabled_mA:.6f} mA")
+    print(f"D4 UART TX active = {d4_active_mean_mA:.6f} mA")
+    print(f"D3-D1 enable overhead = {uart_enable_overhead_mA:.6f} mA")
+    print(f"D4-D3 TX activity overhead = {tx_activity_overhead_mA:.6f} mA")
+    print(f"D4-D1 total UART difference = {total_uart_difference_mA:.6f} mA")
+
+    print(f"Saved prediction CSV: {out_csv}")
     print(f"Saved plot: {out_plot}")
 
     return summary
+
+
+def save_condition_decomposition_summary(summary_df: pd.DataFrame):
+    cols = [
+        "D1_idle_baseline_mA",
+        "D3_uart_enabled_idle_mA",
+        "D4_uart_tx_active_mA",
+        "D3_minus_D1_uart_enable_overhead_mA",
+        "D4_minus_D3_tx_activity_overhead_mA",
+        "D4_minus_D1_total_uart_difference_mA",
+    ]
+
+    decomposition_summary = (
+        summary_df
+        .groupby("condition")
+        .agg(
+            runs=("run_index", "count"),
+            D1_mean_mA=("D1_idle_baseline_mA", "mean"),
+            D3_mean_mA=("D3_uart_enabled_idle_mA", "mean"),
+            D4_mean_mA=("D4_uart_tx_active_mA", "mean"),
+            uart_enable_overhead_mean_mA=("D3_minus_D1_uart_enable_overhead_mA", "mean"),
+            uart_enable_overhead_std_mA=("D3_minus_D1_uart_enable_overhead_mA", "std"),
+            tx_activity_overhead_mean_mA=("D4_minus_D3_tx_activity_overhead_mA", "mean"),
+            tx_activity_overhead_std_mA=("D4_minus_D3_tx_activity_overhead_mA", "std"),
+            total_uart_difference_mean_mA=("D4_minus_D1_total_uart_difference_mA", "mean"),
+            total_uart_difference_std_mA=("D4_minus_D1_total_uart_difference_mA", "std"),
+        )
+        .reset_index()
+    )
+
+    out = RESULTS_ROOT / "summary_uart_occupancy_baseline_decomposition.csv"
+    decomposition_summary.to_csv(out, index=False)
+
+    print(f"Saved decomposition summary: {out}")
 
 
 def main():
@@ -349,10 +459,20 @@ def main():
 
     print(f"Found {len(processed_files)} processed CSV files.")
 
+    d1_means_by_run = load_d1_idle_baseline_means()
+    d3_means_by_run = load_d3_uart_enabled_means()
+
+    print(f"Loaded D1 idle baseline runs: {sorted(d1_means_by_run.keys())}")
+    print(f"Loaded D3 UART enabled runs: {sorted(d3_means_by_run.keys())}")
+
     summaries = []
 
     for processed_file in processed_files:
-        summary = process_one_file(processed_file)
+        summary = process_one_file(
+            processed_file,
+            d1_means_by_run,
+            d3_means_by_run
+        )
         summaries.append(summary)
 
     summary_df = pd.DataFrame(summaries)
@@ -360,6 +480,8 @@ def main():
     summary_out = RESULTS_ROOT / "summary_uart_occupancy_input_validation.csv"
     summary_out.parent.mkdir(parents=True, exist_ok=True)
     summary_df.to_csv(summary_out, index=False)
+
+    save_condition_decomposition_summary(summary_df)
 
     print(f"\nSaved summary: {summary_out}")
     print("Done.")
