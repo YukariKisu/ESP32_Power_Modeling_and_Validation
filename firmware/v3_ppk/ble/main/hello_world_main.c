@@ -36,7 +36,7 @@
 #define WORKLOAD_CORE           1
 
 /* BLE advertising workload settings */
-#define BLE_ADV_INTERVAL_MS     1000
+#define BLE_ADV_INTERVAL_MS     100
 #define BLE_ADV_INTERVAL_UNITS  ((uint16_t)((BLE_ADV_INTERVAL_MS * 1000) / 625))
 #define BLE_ADV_PAYLOAD_SIZE    31
 #define BLE_TX_POWER_LEVEL      ESP_PWR_LVL_P3

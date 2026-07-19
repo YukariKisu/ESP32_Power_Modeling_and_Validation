@@ -108,20 +108,32 @@ def read_ppk_csv(path: Path, current_unit: str) -> pd.DataFrame:
     time_col = find_column(df.columns, TIME_COLUMN_CANDIDATES, "time")
     current_col = find_column(df.columns, CURRENT_COLUMN_CANDIDATES, "current")
 
-    time_s = pd.to_numeric(df[time_col], errors="coerce").to_numpy(dtype=float)
+    time_raw = pd.to_numeric(df[time_col], errors="coerce").to_numpy(dtype=float)
     current_raw = pd.to_numeric(df[current_col], errors="coerce").to_numpy(dtype=float)
 
-    valid = np.isfinite(time_s) & np.isfinite(current_raw)
-    time_s = time_s[valid]
+    valid = np.isfinite(time_raw) & np.isfinite(current_raw)
+    time_raw = time_raw[valid]
     current_raw = current_raw[valid]
 
-    if len(time_s) < 10:
+    if len(time_raw) < 10:
         raise ValueError(f"Not enough valid samples in {path}")
 
+    time_s = convert_time_to_s(time_raw, time_col)
     time_s = time_s - time_s[0]
     current_ma = convert_current_to_ma(current_raw, current_col, current_unit)
 
     return pd.DataFrame({"time_s": time_s, "current_ma": current_ma})
+
+
+def convert_time_to_s(values: np.ndarray, column_name: str) -> np.ndarray:
+    name = normalize_name(column_name)
+
+    if "ms" in name:
+        return values / 1000.0
+    if "us" in name or "µs" in name:
+        return values / 1000000.0
+
+    return values
 
 
 def convert_current_to_ma(values: np.ndarray, column_name: str, current_unit: str) -> np.ndarray:
