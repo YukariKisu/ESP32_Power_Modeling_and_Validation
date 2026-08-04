@@ -12,39 +12,52 @@ import pandas as pd
 # Fixed paths
 # ============================================================
 
+RAW_ROOT = Path(
+    "data/raw/v3_ppk/peripheral/adc/final_predictioned"
+)
+
 RAW_PATHS = {
-    "idle_baseline": Path("data/raw/v3_ppk/idle_baseline"),
-    "adc_init_only": Path(
-        "data/raw/v3_ppk/peripheral/adc/adc_init_only"
+    "idle_baseline": Path(
+        "data/raw/v3_ppk/idle_baseline"
     ),
-    "adc_burst_100ms_10samples": Path(
-        "data/raw/v3_ppk/peripheral/adc/adc_periodic_burst/"
-        "adc_burst_100ms_10samples"
+    "adc_init_only": (
+        RAW_ROOT / "adc_init_only"
     ),
-    "adc_burst_100ms_100samples": Path(
-        "data/raw/v3_ppk/peripheral/adc/adc_periodic_burst/"
-        "adc_burst_100ms_100samples"
+    "adc_single_1ms": (
+        RAW_ROOT
+        / "adc_periodic_single"
+        / "adc_single_1ms"
     ),
-    "adc_burst_100ms_1000samples": Path(
-        "data/raw/v3_ppk/peripheral/adc/adc_periodic_burst/"
-        "adc_burst_100ms_1000samples"
+    "adc_single_10ms": (
+        RAW_ROOT
+        / "adc_periodic_single"
+        / "adc_single_10ms"
     ),
-    "adc_single_1ms": Path(
-        "data/raw/v3_ppk/peripheral/adc/adc_periodic_single/"
-        "adc_single_1ms"
+    "adc_single_100ms": (
+        RAW_ROOT
+        / "adc_periodic_single"
+        / "adc_single_100ms"
     ),
-    "adc_single_10ms": Path(
-        "data/raw/v3_ppk/peripheral/adc/adc_periodic_single/"
-        "adc_single_10ms"
+    "adc_burst_100ms_10samples": (
+        RAW_ROOT
+        / "adc_periodic_burst"
+        / "adc_burst_100ms_10samples"
     ),
-    "adc_single_100ms": Path(
-        "data/raw/v3_ppk/peripheral/adc/adc_periodic_single/"
-        "adc_single_100ms"
+    "adc_burst_100ms_100samples": (
+        RAW_ROOT
+        / "adc_periodic_burst"
+        / "adc_burst_100ms_100samples"
+    ),
+    "adc_burst_100ms_1000samples": (
+        RAW_ROOT
+        / "adc_periodic_burst"
+        / "adc_burst_100ms_1000samples"
     ),
 }
 
 OUTPUT_DIR = Path(
-    "data/processed/v3_ppk/peripheral/adc/baseline_decomposition"
+    "data/processed/v3_ppk/peripheral/adc/"
+    "final_predictioned/baseline_decomposition"
 )
 
 # ============================================================

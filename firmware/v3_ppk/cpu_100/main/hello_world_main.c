@@ -8,6 +8,7 @@
 #include "driver/gpio.h"
 
 #include "sdkconfig.h"
+#include "esp_cpu.h"
 
 /* ---------------- Experiment settings ---------------- */
 
@@ -15,11 +16,20 @@
 #define ACTIVE_DURATION_MS      20000
 #define FINAL_IDLE_MS           10000
 
+#define WORKLOAD_DUTY_PERCENT   100
+#define CONTROL_INTERVAL_US     5
 
 #define EXPECTED_CPU_FREQ_HZ    240000000UL
-#define CPU_FREQ_HZ ((uint32_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000000UL)
+#define CPU_FREQ_HZ \
+    ((uint32_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000000UL)
 
 #define WORKLOAD_CORE           1
+
+/* Logging:
+   1 = enable UART log
+   0 = disable UART log for measurement
+*/
+#define ENABLE_LOG              0
 
 /* GPIO marker:
    1 = use marker for timing check
@@ -28,10 +38,21 @@
 #define USE_MARKER              0
 #define MARKER_GPIO             25
 
-
 /* 0 = idle, 1 = active */
 static volatile int g_workload_state = 0;
 static volatile bool g_experiment_running = true;
+
+/* Prevent optimization */
+static volatile uint32_t g_workload_result = 1;
+
+
+/* ---------------- Logging ---------------- */
+
+#if ENABLE_LOG
+#define LOG_PRINTF(...) printf(__VA_ARGS__)
+#else
+#define LOG_PRINTF(...) do { } while (0)
+#endif
 
 
 /* ---------------- GPIO marker ---------------- */
@@ -66,17 +87,11 @@ static inline void marker_set(int level)
 
 static inline void do_workload_operation(void)
 {
-    asm volatile (
-        "nop\n"
-        "nop\n"
-        "nop\n"
-        "nop\n"
-        "nop\n"
-        "nop\n"
-        "nop\n"
-        "nop\n"
-        ::: "memory"
-    );
+    g_workload_result =
+        (g_workload_result * 1664525U) + 1013904223U;
+
+    g_workload_result ^= g_workload_result >> 13;
+    g_workload_result *= 2654435761U;
 }
 
 static void run_busy_ccount_us(uint32_t busy_us)
@@ -86,10 +101,12 @@ static void run_busy_ccount_us(uint32_t busy_us)
 
     uint32_t start_cycles = esp_cpu_get_cycle_count();
 
-    while ((uint32_t)(esp_cpu_get_cycle_count() - start_cycles) < target_cycles) {
+    while ((uint32_t)(esp_cpu_get_cycle_count() - start_cycles)
+           < target_cycles) {
         do_workload_operation();
     }
 }
+
 
 /* ---------------- Workload task on Core 1 ---------------- */
 
@@ -104,13 +121,38 @@ static void cpu_workload_task(void *parameter)
             continue;
         }
 
+#if WORKLOAD_DUTY_PERCENT == 100
+
         while (g_experiment_running && g_workload_state == 1) {
-            asm volatile ("nop");
+            run_busy_ccount_us(CONTROL_INTERVAL_US);
         }
+
+#else
+
+        const uint32_t cycle_us = 100000;
+
+        const uint32_t busy_us =
+            (cycle_us * WORKLOAD_DUTY_PERCENT) / 100;
+
+        while (g_experiment_running && g_workload_state == 1) {
+
+            run_busy_ccount_us(busy_us);
+
+            uint32_t idle_us = cycle_us - busy_us;
+
+            if (idle_us >= 1000) {
+                vTaskDelay(pdMS_TO_TICKS(idle_us / 1000));
+            } else {
+                taskYIELD();
+            }
+        }
+
+#endif
     }
 
     vTaskDelete(NULL);
 }
+
 
 /* ---------------- Main experiment ---------------- */
 
@@ -118,26 +160,30 @@ void app_main(void)
 {
     uint32_t cpu_freq_hz = CPU_FREQ_HZ;
 
-    printf("# experiment=ppk2_cpu_only_minimum_nop_100\n");
-    printf("# sleep_mode=disabled\n");
-    printf("# peripherals=disabled\n");
-    printf("# measurement_device=PPK2\n");
-    printf("# internal_current_sensor=disabled\n");
-    printf("# workload_definition=minimum_core_only_workload\n");
-    printf("# workload_components=nop_loop\n");
-    printf("# cpu_freq_hz=%lu\n", (unsigned long)cpu_freq_hz);
-    printf("# expected_cpu_freq_hz=%lu\n", (unsigned long)EXPECTED_CPU_FREQ_HZ);
-    printf("# workload_core=%d\n", WORKLOAD_CORE);
-    printf("# initial_idle_ms=%d\n", INITIAL_IDLE_MS);
-    printf("# active_duration_ms=%d\n", ACTIVE_DURATION_MS);
-    printf("# final_idle_ms=%d\n", FINAL_IDLE_MS);
-    printf("# use_marker=%d\n", USE_MARKER);
-    printf("# marker_gpio=%d\n", MARKER_GPIO);
-    printf("# workload_mode=simple_continuous_nop_loop\n");
-    printf("# ccount_control=disabled\n");
+    LOG_PRINTF("# experiment=ppk2_cpu_only_transient\n");
+    LOG_PRINTF("# measurement_device=PPK2\n");
+    LOG_PRINTF("# internal_current_sensor=disabled\n");
+    LOG_PRINTF("# cpu_freq_hz=%lu\n",
+               (unsigned long)cpu_freq_hz);
+    LOG_PRINTF("# expected_cpu_freq_hz=%lu\n",
+               (unsigned long)EXPECTED_CPU_FREQ_HZ);
+    LOG_PRINTF("# workload_core=%d\n", WORKLOAD_CORE);
+    LOG_PRINTF("# workload_duty_percent=%d\n",
+               WORKLOAD_DUTY_PERCENT);
+    LOG_PRINTF("# control_interval_us=%d\n",
+               CONTROL_INTERVAL_US);
+    LOG_PRINTF("# initial_idle_ms=%d\n",
+               INITIAL_IDLE_MS);
+    LOG_PRINTF("# active_duration_ms=%d\n",
+               ACTIVE_DURATION_MS);
+    LOG_PRINTF("# final_idle_ms=%d\n",
+               FINAL_IDLE_MS);
+    LOG_PRINTF("# enable_log=%d\n", ENABLE_LOG);
+    LOG_PRINTF("# use_marker=%d\n", USE_MARKER);
+    LOG_PRINTF("# marker_gpio=%d\n", MARKER_GPIO);
 
     if (cpu_freq_hz != EXPECTED_CPU_FREQ_HZ) {
-        printf("# WARNING: CPU frequency is not 240MHz\n");
+        LOG_PRINTF("# WARNING: CPU frequency is not 240MHz\n");
     }
 
     marker_init();
@@ -157,23 +203,23 @@ void app_main(void)
         );
 
     if (workload_created != pdPASS) {
-        printf("# workload_task_creation_failed\n");
+        LOG_PRINTF("# workload_task_creation_failed\n");
         return;
     }
 
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    printf("# phase=initial_idle\n");
+    LOG_PRINTF("# phase=initial_idle\n");
     g_workload_state = 0;
     marker_set(0);
     vTaskDelay(pdMS_TO_TICKS(INITIAL_IDLE_MS));
 
-    printf("# phase=active\n");
+    LOG_PRINTF("# phase=active\n");
     g_workload_state = 1;
     marker_set(1);
     vTaskDelay(pdMS_TO_TICKS(ACTIVE_DURATION_MS));
 
-    printf("# phase=final_idle\n");
+    LOG_PRINTF("# phase=final_idle\n");
     g_workload_state = 0;
     marker_set(0);
     vTaskDelay(pdMS_TO_TICKS(FINAL_IDLE_MS));
@@ -182,5 +228,7 @@ void app_main(void)
 
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    printf("# experiment_complete\n");
+    LOG_PRINTF("# experiment_complete\n");
+    LOG_PRINTF("# workload_result=%lu\n",
+               (unsigned long)g_workload_result);
 }
