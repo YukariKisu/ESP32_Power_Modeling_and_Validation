@@ -21,9 +21,9 @@ INPUT_DIRS = {
 OUTPUT_DIR = Path("results/v3_ppk/peripheral/ble_adv_only/mae_input_definitions")
 
 # CPU-trained ODE parameters. Replace these with your final fitted values.
-ODE_GAIN_MA = 21.310
-ODE_TAU_RISE_S = 0.050
-ODE_TAU_FALL_S = 0.050
+ODE_GAIN_MA = 21.1888
+ODE_TAU_RISE_S = 0.000490
+ODE_TAU_FALL_S = 0.000490
 
 # BLE input definition.
 ACTIVE_DURATION_S = 20.0
