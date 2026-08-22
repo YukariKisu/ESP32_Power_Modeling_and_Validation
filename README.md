@@ -37,11 +37,11 @@ When prediction fails, is the main cause the model parameters, the model structu
 
 A first-order ODE was used to model the current response:
 
-$$
+```math
 \frac{dI(t)}{dt}
 =
 \frac{I_{\mathrm{idle}}+\Delta I\,u(t)-I(t)}{\tau}
-$$
+```
 
 where:
 
